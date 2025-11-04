@@ -1,0 +1,23 @@
+{
+	"FileVersion" : 3,
+	
+	"FriendlyName" : "TeamArena",
+	"Version" : 2,
+	"VersionName" : "2.0",
+	"CreatedBy" : "phantaci",
+	"CreatedByURL" : "https://ut4stats.com",
+	"EngineVersion" : "4.15.0",
+	"Description" : "UT4 TAM",
+	"Category" : "UnrealTournament.UT4AC",
+  "EnabledByDefault": true,
+  "CanContainContent":  false,
+	
+	"Modules" :
+	[
+		{
+			"Name" : "TeamArena",
+			"Type" : "Runtime",
+			"WhitelistPlatforms" : [ "Win32", "Win64", "Linux" ]
+		}
+	]
+}
