@@ -520,6 +520,13 @@ protected:
 	FVector FindSafeSpawnOffset(APlayerStart* BaseSpawn, int32 AttemptIndex);
 	bool IsLocationClearOfPlayers(const FVector& Location, float CheckRadius = 150.0f);
 	void ResetSpawnSelectionForNewRound();
+	/** Minimum distance required between team spawns and enemy spawns */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Arena|Spawning", meta = (ClampMin = "500.0", ClampMax = "5000.0"))
+	float MinimumEnemySpawnDistance;
+
+	/** Preferred distance between team spawns and enemy spawns (used for scoring) */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Arena|Spawning", meta = (ClampMin = "1000.0", ClampMax = "10000.0"))
+	float PreferredEnemySpawnDistance;
 	
 	UPROPERTY(Transient)
 	AActor* OverriddenPlayerStart;
@@ -543,13 +550,6 @@ protected:
 	UPROPERTY()
 	float LastLobbyUpdateTime;
 
-	/** Auto restart time for empty servers */
-	UPROPERTY()
-	int32 AutoRestartTime;
-
-	/** Lobby initial timeout */
-	UPROPERTY()
-	float LobbyInitialTimeoutTime;
 
 
 	/** Track team damage for each round */

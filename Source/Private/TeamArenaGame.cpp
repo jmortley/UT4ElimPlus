@@ -62,7 +62,7 @@ AUTeamArenaGame::AUTeamArenaGame(const FObjectInitializer& ObjectInitializer)
 	bWarmupMode = false;
 	SpectateDelay = 2.f;
 	TotalRoundsPlayed = 0;
-	HighDamageCarryThreshold = 75.0f;
+	HighDamageCarryThreshold = 70.0f;
 	//bCasterControl = true;
 	// Initialize last man standing tracking
 	Team0StartingSize = 0;
@@ -95,10 +95,12 @@ AUTeamArenaGame::AUTeamArenaGame(const FObjectInitializer& ObjectInitializer)
 	CurrentWaveDamage = 0.0f;
 
 	//Spawn weighting system with default values
-	SpawnDistanceWeight = 0.30f;
+	SpawnDistanceWeight = 0.45f;
 	SpawnHeightWeight = 0.10f;
-	SpawnUsageWeight = 0.45f;
+	SpawnUsageWeight = 0.30f;
 	SpawnSeparationWeight = 0.15f;
+	//MinimumEnemySpawnDistance = 2000.0f; // Minimum distance from enemy spawns
+	//PreferredEnemySpawnDistance = 3500.0f; // Preferred distance from enemy spawns
 
 	// OvertimeDamageType = UDamageType::StaticClass(); // Already set above
 	//GameStateClass = AUTGameState::StaticClass();
@@ -237,6 +239,7 @@ void AUTeamArenaGame::CallMatchStateChangeNotify()
 	{
 		// Ensure warmup mode is disabled once match is starting
 		bWarmupMode = false;
+		ResetSpawnSelectionForNewRound();
 	}
 	if (GetMatchState() == MatchState::MatchIntermission || GetMatchState() == FName(TEXT("RoundCooldown")))
 	{
@@ -280,6 +283,12 @@ void AUTeamArenaGame::DeferredCheckRoundWinConditions()
 
 void AUTeamArenaGame::DefaultTimer()
 {
+	
+	if (GetWorld()->WorldType == EWorldType::EditorPreview)
+	{
+		return;
+	}
+
 	
 	if (IsPendingKill() || HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed))
 		return;
@@ -446,6 +455,19 @@ void AUTeamArenaGame::HandleMapVoting()
 
 void AUTeamArenaGame::HandleInstanceCleanup()
 {
+	
+	// EDITOR SAFETY: Don't run server management in editor/blueprint context
+	if (GetWorld() == nullptr || GetWorld()->WorldType != EWorldType::Game)
+	{
+		return;
+	}
+
+	// ADDITIONAL SAFETY: Don't run if we're not in a proper game context
+	if (!HasAuthority() && GetNetMode() != NM_Standalone)
+	{
+		return;
+	}
+
 	// 1. Hub instance cleanup
 	if (IsGameInstanceServer() && LobbyBeacon)
 	{
@@ -1232,13 +1254,11 @@ void AUTeamArenaGame::SelectOptimalSpawnPairForTeam(int32 TeamIndex)
 		FindMaxDistanceSpawnPair(Candidates, EnemySpawns, PrimarySpawn, SecondarySpawn);
 		break;
 
-	case 1: // Usage-focused selection (favor least used)
-		FindLeastUsedSpawnPair(Candidates, TeamIndex, PrimarySpawn, SecondarySpawn);
-		break;
-
-	case 2: // Balanced selection with random element
+	case 1: // MODIFIED: This now calls BalancedRandom instead of LeastUsed
 		FindBalancedRandomSpawnPair(Candidates, EnemySpawns, TeamIndex, PrimarySpawn, SecondarySpawn);
 		break;
+
+		// Strategy 1 (FindLeastUsedSpawnPair) is now skipped
 	}
 
 	//FindMaxDistanceSpawnPair(Candidates, EnemySpawns, PrimarySpawn, SecondarySpawn);
@@ -1273,125 +1293,7 @@ void AUTeamArenaGame::SelectOptimalSpawnPairForTeam(int32 TeamIndex)
 }
 
 
-/*
-void AUTeamArenaGame::FindMaxDistanceSpawnPair(const TArray<FSpawnPointData*>& CandidateSpawns, const TArray<APlayerStart*>& EnemySpawns, APlayerStart*& OutPrimary, APlayerStart*& OutSecondary)
-{
-	OutPrimary = nullptr;
-	OutSecondary = nullptr;
-	if (CandidateSpawns.Num() < 2)
-	{
-		if (CandidateSpawns.Num() == 1)
-		{
-			OutPrimary = CandidateSpawns[0]->PlayerStart;
-		}
-		return;
-	}
-	float BestScore = -1.0f;
-	for (int32 i = 0; i < CandidateSpawns.Num(); ++i)
-	{
-		for (int32 j = i + 1; j < CandidateSpawns.Num(); ++j)
-		{
-			APlayerStart* Spawn1 = CandidateSpawns[i]->PlayerStart;
-			APlayerStart* Spawn2 = CandidateSpawns[j]->PlayerStart;
-			if (!Spawn1 || !Spawn2) continue;
-			float MinDist1 = CalculateMinDistanceToEnemySpawns(Spawn1, EnemySpawns);
-			float MinDist2 = CalculateMinDistanceToEnemySpawns(Spawn2, EnemySpawns);
-			float HeightScore1 = CandidateSpawns[i]->HeightScore;
-			float HeightScore2 = CandidateSpawns[j]->HeightScore;
-			float UsageScore1 = 1.0f / (1.0f + CandidateSpawns[i]->GetUsageCountForTeam(0) + CandidateSpawns[i]->GetUsageCountForTeam(1));
-			float UsageScore2 = 1.0f / (1.0f + CandidateSpawns[j]->GetUsageCountForTeam(0) + CandidateSpawns[j]->GetUsageCountForTeam(1));
-			float SpawnSeparation = FVector::Dist(Spawn1->GetActorLocation(), Spawn2->GetActorLocation());
-			float SeparationScore = FMath::Min(SpawnSeparation / 1000.0f, 1.0f);
-			float CombinedScore = (MinDist1 + MinDist2) * 0.4f + (HeightScore1 + HeightScore2) * 0.3f + (UsageScore1 + UsageScore2) * 0.2f + SeparationScore * 0.1f;
-			if (CombinedScore > BestScore)
-			{
-				BestScore = CombinedScore;
-				if (HeightScore1 >= HeightScore2)
-				{
-					OutPrimary = Spawn1;
-					OutSecondary = Spawn2;
-				}
-				else
-				{
-					OutPrimary = Spawn2;
-					OutSecondary = Spawn1;
-				}
-			}
-		}
-	}
-}
 
-
-void AUTeamArenaGame::FindMaxDistanceSpawnPair(const TArray<FSpawnPointData*>& CandidateSpawns, const TArray<APlayerStart*>& EnemySpawns, APlayerStart*& OutPrimary, APlayerStart*& OutSecondary)
-{
-	OutPrimary = nullptr;
-	OutSecondary = nullptr;
-	if (CandidateSpawns.Num() < 2)
-	{
-		if (CandidateSpawns.Num() == 1)
-		{
-			OutPrimary = CandidateSpawns[0]->PlayerStart;
-		}
-		return;
-	}
-
-	// Normalize weights to ensure they sum to 1.0
-	float TotalWeight = SpawnDistanceWeight + SpawnHeightWeight + SpawnUsageWeight + SpawnSeparationWeight;
-	float NormalizedDistanceWeight = (TotalWeight > 0.0f) ? SpawnDistanceWeight / TotalWeight : 0.25f;
-	float NormalizedHeightWeight = (TotalWeight > 0.0f) ? SpawnHeightWeight / TotalWeight : 0.25f;
-	float NormalizedUsageWeight = (TotalWeight > 0.0f) ? SpawnUsageWeight / TotalWeight : 0.25f;
-	float NormalizedSeparationWeight = (TotalWeight > 0.0f) ? SpawnSeparationWeight / TotalWeight : 0.25f;
-
-	float BestScore = -1.0f;
-	for (int32 i = 0; i < CandidateSpawns.Num(); ++i)
-	{
-		for (int32 j = i + 1; j < CandidateSpawns.Num(); ++j)
-		{
-			APlayerStart* Spawn1 = CandidateSpawns[i]->PlayerStart;
-			APlayerStart* Spawn2 = CandidateSpawns[j]->PlayerStart;
-			if (!Spawn1 || !Spawn2) continue;
-			float MinDist1 = CalculateMinDistanceToEnemySpawns(Spawn1, EnemySpawns);
-			float MinDist2 = CalculateMinDistanceToEnemySpawns(Spawn2, EnemySpawns);
-			float HeightScore1 = CandidateSpawns[i]->HeightScore;
-			float HeightScore2 = CandidateSpawns[j]->HeightScore;
-
-			// CHANGE: Increase the weight of usage score to encourage more variety
-			float UsageScore1 = 1.0f / (1.0f + CandidateSpawns[i]->GetUsageCountForTeam(0) + CandidateSpawns[i]->GetUsageCountForTeam(1));
-			float UsageScore2 = 1.0f / (1.0f + CandidateSpawns[j]->GetUsageCountForTeam(0) + CandidateSpawns[j]->GetUsageCountForTeam(1));
-
-			float SpawnSeparation = FVector::Dist(Spawn1->GetActorLocation(), Spawn2->GetActorLocation());
-			float SeparationScore = FMath::Min(SpawnSeparation / 1000.0f, 1.0f);
-
-			// CHANGE: Rebalance the weights to prioritize usage variety more
-			// Old: Distance=40%, Height=30%, Usage=20%, Separation=10%
-			// New: Distance=30%, Height=10%, Usage=45%, Separation=15%
-			//float CombinedScore = (MinDist1 + MinDist2) * 0.3f + (HeightScore1 + HeightScore2) * 0.10f + (UsageScore1 + UsageScore2) * 0.45f + SeparationScore * 0.15f;
-
-			float CombinedScore = (MinDist1 + MinDist2) * NormalizedDistanceWeight +
-				(HeightScore1 + HeightScore2) * NormalizedHeightWeight +
-				(UsageScore1 + UsageScore2) * NormalizedUsageWeight +
-				SeparationScore * NormalizedSeparationWeight;
-
-			if (CombinedScore > BestScore)
-			{
-				BestScore = CombinedScore;
-				if (HeightScore1 >= HeightScore2)
-				{
-					OutPrimary = Spawn1;
-					OutSecondary = Spawn2;
-				}
-				else
-				{
-					OutPrimary = Spawn2;
-					OutSecondary = Spawn1;
-				}
-			}
-		}
-	}
-}
-*/
-
-// IMPROVED: Modified version of existing function with dynamic weights
 void AUTeamArenaGame::FindMaxDistanceSpawnPair(const TArray<FSpawnPointData*>& CandidateSpawns, const TArray<APlayerStart*>& EnemySpawns, APlayerStart*& OutPrimary, APlayerStart*& OutSecondary)
 {
 	OutPrimary = nullptr;
@@ -1473,7 +1375,7 @@ void AUTeamArenaGame::FindMaxDistanceSpawnPair(const TArray<FSpawnPointData*>& C
 			});
 
 		// NEW: Instead of always picking the best, randomly select from top 3 pairs
-		int32 TopPairsToConsider = FMath::Min(3, ScoredPairs.Num());
+		int32 TopPairsToConsider = FMath::Min(2, ScoredPairs.Num());
 		int32 SelectedPairIndex = FMath::RandRange(0, TopPairsToConsider - 1);
 
 		const FSpawnPairScore& SelectedPair = ScoredPairs[SelectedPairIndex];
@@ -1496,6 +1398,7 @@ void AUTeamArenaGame::FindMaxDistanceSpawnPair(const TArray<FSpawnPointData*>& C
 		}
 	}
 }
+
 
 
 void AUTeamArenaGame::FindLeastUsedSpawnPair(const TArray<FSpawnPointData*>& CandidateSpawns, int32 TeamIndex, APlayerStart*& OutPrimary, APlayerStart*& OutSecondary)
@@ -1534,6 +1437,8 @@ void AUTeamArenaGame::FindLeastUsedSpawnPair(const TArray<FSpawnPointData*>& Can
 		OutSecondary = SortedCandidates[1]->PlayerStart;
 	}
 }
+
+
 
 // NEW: Balanced selection with randomization
 void AUTeamArenaGame::FindBalancedRandomSpawnPair(const TArray<FSpawnPointData*>& CandidateSpawns, const TArray<APlayerStart*>& EnemySpawns, int32 TeamIndex, APlayerStart*& OutPrimary, APlayerStart*& OutSecondary)
@@ -1632,33 +1537,6 @@ float AUTeamArenaGame::CalculateMinDistanceToEnemySpawns(APlayerStart* SpawnPoin
 	return (MinDistance == FLT_MAX) ? 10000.0f : MinDistance;
 }
 
-/*
-TArray<FSpawnPointData*> AUTeamArenaGame::GetSpawnCandidatesForTeam(int32 TeamIndex)
-{
-	TArray<FSpawnPointData*> Candidates;
-	for (FSpawnPointData& SpawnData : AllSpawnPoints)
-	{
-		if (!SpawnData.PlayerStart) continue;
-		bool bIsTeamSide = (TeamIndex == 0 && SpawnData.TeamSideScore <= 0.0f) || (TeamIndex == 1 && SpawnData.TeamSideScore >= 0.0f);
-		if (bIsTeamSide || FMath::Abs(SpawnData.TeamSideScore) < 0.2f)
-		{
-			Candidates.Add(&SpawnData);
-		}
-	}
-	Candidates.Sort([TeamIndex](const FSpawnPointData& A, const FSpawnPointData& B)
-		{
-			int32 UsageA = A.GetUsageCountForTeam(TeamIndex);
-			int32 UsageB = B.GetUsageCountForTeam(TeamIndex);
-			if (UsageA != UsageB)
-			{
-				return UsageA < UsageB;
-			}
-			float ScoreA = A.HeightScore + FMath::Abs(A.TeamSideScore);
-			float ScoreB = B.HeightScore + FMath::Abs(B.TeamSideScore);
-			return ScoreA > ScoreB;
-		});
-	return Candidates;
-}
 
 FVector AUTeamArenaGame::FindSafeSpawnOffset(APlayerStart* BaseSpawn, int32 AttemptIndex)
 {
@@ -1670,17 +1548,7 @@ FVector AUTeamArenaGame::FindSafeSpawnOffset(APlayerStart* BaseSpawn, int32 Atte
 	FVector TestLocation = BaseLocation + Offset;
 	return TestLocation;
 }
-*/
-FVector AUTeamArenaGame::FindSafeSpawnOffset(APlayerStart* BaseSpawn, int32 AttemptIndex)
-{
-	if (!BaseSpawn) return FVector::ZeroVector;
-	FVector BaseLocation = BaseSpawn->GetActorLocation();
-	float Angle = (AttemptIndex * 45.0f) * PI / 180.0f;
-	float Distance = SpawnOffsetDistance * (1.0f + AttemptIndex * 0.5f);
-	FVector Offset = FVector(FMath::Cos(Angle) * Distance, FMath::Sin(Angle) * Distance, 0.0f);
-	FVector TestLocation = BaseLocation + Offset;
-	return TestLocation;
-}
+
 
 // IMPROVED: Add randomization to candidate selection
 TArray<FSpawnPointData*> AUTeamArenaGame::GetSpawnCandidatesForTeam(int32 TeamIndex)
@@ -1733,6 +1601,7 @@ TArray<FSpawnPointData*> AUTeamArenaGame::GetSpawnCandidatesForTeam(int32 TeamIn
 
 	return Candidates;
 }
+
 
 
 
