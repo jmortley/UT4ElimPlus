@@ -3,15 +3,13 @@
 // Always include CoreMinimal first in UCLASS headers.
 //#include "CoreMinimal.h"
 #include "TeamArena.h"
-
 #include "CoreMinimal.h"
-// Use the team base (per your change)
 #include "UTTeamGameMode.h"
+#include "UTGameState.h"
 #include "UTDamageType.h" 
 #include "Templates/SubclassOf.h"
 #include "TimerManager.h"
 #include "UTLineUpHelper.h"
-// Keep generated.h LAST
 #include "TeamArenaGame.generated.h"
 
 // Forward declarations to avoid pulling heavy headers here.
@@ -85,6 +83,7 @@ struct FSpawnPointData
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnPlayerACE, AUTPlayerState*, PlayerState);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnPlayerDarkHorse, AUTPlayerState*, PlayerState, int32, EnemiesKilled);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnPlayerHighDamageCarry, AUTPlayerState*, PlayerState, float, DamagePercentage);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnClutchSituationStarted, AUTPlayerState*, ClutchPlayer, int32, EnemiesAlive);
 
 
 UCLASS(Config = Game)
@@ -125,6 +124,33 @@ public:
 	UPROPERTY(VisibleInstanceOnly, BlueprintReadOnly, Category = "Arena|State")
 	int32 LastRoundWinningTeamIndex;
 
+	/** Total number of rounds played (including draws) - accessible from Blueprint */
+	UPROPERTY(VisibleInstanceOnly, BlueprintReadOnly, Category = "Arena|State")
+	int32 TotalRoundsPlayed;
+
+	/** Restart the current round - useful for handling disconnections or other issues during official matches */
+	UFUNCTION(BlueprintCallable, Category = "TeamArena|Round Control")
+	void BP_RestartCurrentRound();
+
+	// C++ calls these; BP implements them (no headers, no reflection in C++).
+	UFUNCTION(BlueprintImplementableEvent, Category = "Arena|Bridge")
+	void BP_OnSetIntermission(bool bInIntermission, int32 IntermissionRemain);
+
+	UFUNCTION(BlueprintImplementableEvent, Category = "Arena|Bridge")
+	void BP_OnSetRound(bool bInProgress, int32 RoundRemain, int32 LastWinnerTeamIndex);
+
+	UFUNCTION(BlueprintImplementableEvent, Category = "Arena|Bridge")
+	void BP_OnLastManStanding(int32 LastManTeamIndex, AUTPlayerState* LastManPlayerState);
+
+	UFUNCTION(BlueprintImplementableEvent, Category = "Arena|Bridge")
+	void BP_OnRoundResults(int32 WinnerTeamIndex, bool bIsDraw, bool bAllWinnersAlive);
+
+	UFUNCTION(BlueprintImplementableEvent, Category = "Arena|Bridge")
+	void BP_OnDomination(int32 DominatingTeamIndex);
+
+	UFUNCTION(BlueprintImplementableEvent, Category = "Arena|Bridge")
+	void BP_OnTakesLead(int32 LeadingTeamIndex);
+
 	// Awards
 	UFUNCTION(BlueprintCallable, Category = "TeamArena|Achievements")
 	void RecordACE(AUTPlayerState* PlayerState);
@@ -135,7 +161,13 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "TeamArena|Achievements")
 	void RecordHighDamageCarry(AUTPlayerState* PlayerState, float DamagePercentage);
 
-	//virtual bool CompleteRallyRequest(AController* C) { return false; } override;
+	/** Minimum damage percentage required for WRECKER achievement (default 70%) */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Arena|Achievements", meta = (ClampMin = "0.0", ClampMax = "100.0", ToolTip = "Minimum percentage of team damage a player must deal to earn High Damage Carry achievement"))
+	float HighDamageCarryThreshold = 75.0f;
+
+	/** Called when a player becomes the last one alive on their team (1vX) */
+	UPROPERTY(BlueprintAssignable, Category = "TeamArena|Events")
+	FOnClutchSituationStarted OnClutchSituationStarted;
 
 	// Awards UPROPERTYs
 	UPROPERTY(BlueprintAssignable, Category = "TeamArena|Events")
@@ -146,6 +178,16 @@ public:
 
 	UPROPERTY(BlueprintAssignable, Category = "TeamArena|Events")
 	FOnPlayerHighDamageCarry OnPlayerHighDamageCarry;
+
+	/** BP Callable functions regarding changing MatchState */
+	UFUNCTION(BlueprintCallable, Category = "TeamArena|Match State")
+	void BP_SetMatchState_RoundCooldown();
+
+	UFUNCTION(BlueprintCallable, Category = "TeamArena|Match State")
+	void BP_SetMatchState_Intermission();
+
+	UFUNCTION(BlueprintCallable, Category = "TeamArena|Match State")
+	void BP_SetMatchState_InProgress();
 
 	// -------- Replay opt-in (FlagRun does this) --------
 	//virtual bool SupportsInstantReplay() const override;
@@ -217,10 +259,13 @@ public:
 	// -------- UT overrides --------
 	virtual void InitGame(const FString& MapName, const FString& Options, FString& ErrorMessage) override;
 	virtual void BeginPlay() override;
-	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
+	virtual void InitGameState() override;
+	//virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 	virtual void HandleMatchHasStarted() override;
 	virtual void DefaultTimer() override;
-
+	void Logout(AController* Exiting) override;
+	//void BeginDestroy() override;
+	//static void CleanupCDO();
 	/**
 	 * NEW: Intercepts match state changes to drive round flow.
 	 * This is the key function from UTShowdown.
@@ -231,6 +276,7 @@ public:
 
 	// In UE4 these are valid overrides on AGameMode*
 	virtual AActor* ChoosePlayerStart_Implementation(AController* Player) override;
+	virtual AActor* FindPlayerStart_Implementation(AController* Player, const FString& IncomingName = TEXT("")) override;
 	//virtual float   RatePlayerStart(APlayerStart* Start, AController* Player) override;
 	virtual void    RestartPlayer(AController* NewPlayer) override;
 	virtual void    ScoreKill_Implementation(AController* Killer, AController* Other, APawn* KilledPawn, TSubclassOf<UDamageType> DamageType) override;
@@ -264,7 +310,7 @@ public:
 	void CheckLastManStanding(int32 Alive0, int32 Alive1);
 
 	/** Broadcast last man standing sounds */
-	void BroadcastLastManStanding(int32 LastManTeamIndex);
+	void BroadcastLastManStanding(int32 LastManTeamIndex, AUTPlayerState* LastManPlayerState);
 
 	void BroadcastOvertimeCountdown(int32 CountdownValue);
 
@@ -433,18 +479,36 @@ protected:
 	// -------- Enhanced Spawn Selection System --------
 	UPROPERTY(Transient)
 	TArray<FSpawnPointData> AllSpawnPoints;
+
 	UPROPERTY(Transient)
 	TArray<APlayerStart*> Team0SelectedSpawns;
+
 	UPROPERTY(Transient)
 	TArray<APlayerStart*> Team1SelectedSpawns;
+
 	UPROPERTY(Transient)
 	int32 CurrentRoundNumber = 0;
+
 	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Arena|Spawning")
 	float SpawnOffsetDistance = 100.0f;
+
 	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Arena|Spawning")
 	int32 MaxSpawnOffsetAttempts = 8;
+
 	UPROPERTY(Transient)
 	bool bSpawnPointsInitialized = false;
+
+	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Arena|Spawning", meta = (ClampMin = "0.0", ClampMax = "1.0", ToolTip = "Weight for distance from enemy spawns when selecting spawn points"))
+	float SpawnDistanceWeight = 0.30f;
+
+	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Arena|Spawning", meta = (ClampMin = "0.0", ClampMax = "1.0", ToolTip = "Weight for spawn point height when selecting spawn points"))
+	float SpawnHeightWeight = 0.10f;
+
+	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Arena|Spawning", meta = (ClampMin = "0.0", ClampMax = "1.0", ToolTip = "Weight for spawn usage frequency (promotes variety) when selecting spawn points"))
+	float SpawnUsageWeight = 0.45f;
+
+	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Arena|Spawning", meta = (ClampMin = "0.0", ClampMax = "1.0", ToolTip = "Weight for separation between team spawn points when selecting spawn points"))
+	float SpawnSeparationWeight = 0.15f;
 
 	// -------- Enhanced Spawn Selection Functions --------
 	void InitializeSpawnPointSystem();
@@ -456,6 +520,37 @@ protected:
 	FVector FindSafeSpawnOffset(APlayerStart* BaseSpawn, int32 AttemptIndex);
 	bool IsLocationClearOfPlayers(const FVector& Location, float CheckRadius = 150.0f);
 	void ResetSpawnSelectionForNewRound();
+	
+	UPROPERTY(Transient)
+	AActor* OverriddenPlayerStart;
+
+
+	// Server Management 
+		/** Handle all server management tasks (cleanup, map voting, bots, etc.) */
+	void HandleServerManagement();
+
+	/** Handle instance cleanup logic */
+	void HandleInstanceCleanup();
+
+	/** Handle map voting logic */
+	void HandleMapVoting();
+
+	/** Track empty server time for non-hub cleanup */
+	UPROPERTY()
+	int32 EmptyServerTime;
+
+	/** Last lobby update timestamp */
+	UPROPERTY()
+	float LastLobbyUpdateTime;
+
+	/** Auto restart time for empty servers */
+	UPROPERTY()
+	int32 AutoRestartTime;
+
+	/** Lobby initial timeout */
+	UPROPERTY()
+	float LobbyInitialTimeoutTime;
+
 
 	/** Track team damage for each round */
 	UPROPERTY(Transient)
@@ -465,10 +560,15 @@ protected:
 
 	/** Track individual player damage for the current round */
 	UPROPERTY(Transient)
-	TMap<AUTPlayerState*, float> PlayerRoundDamage;
+	//TMap<AUTPlayerState*, float> PlayerRoundDamage;
+	TMap<TWeakObjectPtr<AUTPlayerState>, float> PlayerRoundDamage;
 
 	void CheckRoundAchievements(int32 WinnerTeamIndex, FName Reason);
 	void CheckForACE(int32 WinnerTeamIndex);
 	void CheckForDarkHorse(int32 WinnerTeamIndex);
 	void CheckForHighDamageCarry(int32 WinnerTeamIndex);
+
+	// New spawn selection methods
+	void FindLeastUsedSpawnPair(const TArray<FSpawnPointData*>& CandidateSpawns, int32 TeamIndex, APlayerStart*& OutPrimary, APlayerStart*& OutSecondary);
+	void FindBalancedRandomSpawnPair(const TArray<FSpawnPointData*>& CandidateSpawns, const TArray<APlayerStart*>& EnemySpawns, int32 TeamIndex, APlayerStart*& OutPrimary, APlayerStart*& OutSecondary);
 };

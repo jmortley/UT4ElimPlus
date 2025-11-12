@@ -1,7 +1,7 @@
 #include "TeamArena.h"
 #include "UnrealTournament.h"
 #include "TeamArenaGame.h"
-#include "ArenaGameState.h"
+//#include "GSInterface.h"
 //#include "ArenaPlayerCameraManager.h"
 #include "UTTeamGameMode.h"
 #include "UTGameState.h"
@@ -49,19 +49,21 @@ AUTeamArenaGame::AUTeamArenaGame(const FObjectInitializer& ObjectInitializer)
 	// Round defaults
 	bForceRespawn = false;
 	bHasRespawnChoices = false;
-	ScoreLimit = 7;
-	RoundTimeSeconds = 120;
-	RoundStartDelaySeconds = 3.f; // This is now the "AwardDisplayTime"
+	ScoreLimit = 10;
+	RoundTimeSeconds = 90;
+	RoundStartDelaySeconds = 5.f; // This is now the "AwardDisplayTime"
 	bAllowRespawnMidRound = false;
 	bRoundInProgress = false;
 	bAllowPlayerRespawns = false;
 	LastRoundWinningTeamIndex = INDEX_NONE;
 	AwardDisplayTime = 5.f; // Use this for the post-round delay
 	PreRoundCountdown = 3.f; // Use this for the pre-spawn countdown
-	SpawnProtectionTime = 3.f;
+	//SpawnProtectionTime = 3.f;
 	bWarmupMode = false;
-	SpectateDelay = 2.5f;
-
+	SpectateDelay = 2.f;
+	TotalRoundsPlayed = 0;
+	HighDamageCarryThreshold = 75.0f;
+	//bCasterControl = true;
 	// Initialize last man standing tracking
 	Team0StartingSize = 0;
 	Team1StartingSize = 0;
@@ -77,7 +79,7 @@ AUTeamArenaGame::AUTeamArenaGame(const FObjectInitializer& ObjectInitializer)
 
 	// Match goals (TeamGameMode uses GoalScore)
 	GoalScore = ScoreLimit;
-	TimeLimit = 20;
+	//TimeLimit = 20;
 	//PlayerCameraManagerClass = AArenaPlayerCameraManager::StaticClass();
 
 	// Overtime defaults...
@@ -89,15 +91,46 @@ AUTeamArenaGame::AUTeamArenaGame(const FObjectInitializer& ObjectInitializer)
 	bOvertimeNonLethal = false;
 	OvertimeWaveInterval = 5.0f;
 	OvertimeDamageType = UUTDamageType::StaticClass();
-
 	CurrentOvertimeWave = 0;
 	CurrentWaveDamage = 0.0f;
 
-
+	//Spawn weighting system with default values
+	SpawnDistanceWeight = 0.30f;
+	SpawnHeightWeight = 0.10f;
+	SpawnUsageWeight = 0.45f;
+	SpawnSeparationWeight = 0.15f;
 
 	// OvertimeDamageType = UDamageType::StaticClass(); // Already set above
-	GameStateClass = AURArenaGameState::StaticClass();
+	//GameStateClass = AUTGameState::StaticClass();
 }
+
+
+void AUTeamArenaGame::BP_SetMatchState_RoundCooldown()
+{
+	if (HasAuthority())
+	{
+		SetMatchState(FName(TEXT("RoundCooldown")));
+	}
+}
+
+void AUTeamArenaGame::BP_SetMatchState_Intermission()
+{
+	if (HasAuthority())
+	{
+		SetMatchState(FName(TEXT("Intermission")));
+	}
+}
+
+void AUTeamArenaGame::BP_SetMatchState_InProgress()
+{
+	if (HasAuthority())
+	{
+		SetMatchState(MatchState::InProgress);
+	}
+}
+
+
+
 
 void AUTeamArenaGame::UpdateVictoryMessageSounds()
 {
@@ -129,11 +162,15 @@ void AUTeamArenaGame::BeginPlay()
 {
 	Super::BeginPlay();
 
-	// Configure victory message sounds
-	//UpdateVictoryMessageSounds();
-
+	if (!bSpawnPointsInitialized)
+	{
+		UE_LOG(LogGameMode, Warning, TEXT("Force initializing spawn system in BeginPlay"));
+		InitializeSpawnPointSystem();
+		bSpawnPointsInitialized = true;
+	}
 	//GetWorldTimerManager().SetTimerForNextTick([this]()
 	GetWorldTimerManager().SetTimerForNextTick(this, &AUTeamArenaGame::DeferredHandleMatchStart);
+	UE_LOG(LogTemp, Error, TEXT("GameMode::BeginPlay called"));
 	//GetWorldTimerManager().SetTimerForNextTick(this, &AUTeamArenaGame::DeferredCheckRoundWinConditions);
 
 	// We no longer start intermission here. 
@@ -161,7 +198,7 @@ void AUTeamArenaGame::HandleMatchHasStarted()
 {
 	//Super::HandleMatchHasStarted();
 
-	AURArenaGameState* GS = GetGameState<AURArenaGameState>();
+	AUTGameState* GS = GetGameState<AUTGameState>();
 	if (GS == nullptr)
 	{
 		UE_LOG(LogGameMode, Error, TEXT("HandleMatchHasStarted: AURArenaGameState is NULL. This is normal in PIE if World Settings are not set. Deferring."));
@@ -172,24 +209,36 @@ void AUTeamArenaGame::HandleMatchHasStarted()
 	}
 
 	Super::HandleMatchHasStarted();
-
+	bWarmupMode = false;
 	// This is the true start of the match.
 	// We start in intermission to prepare for Round 1.
+	/*
 	if (!GS->bMatchHasStarted)
 	{
 		UE_LOG(LogGameMode, Log, TEXT("HandleMatchHasStarted: Match is starting. Calling StartIntermission for the first round."));
 		GS->bMatchHasStarted = true;
 		StartIntermission(PreRoundCountdown);
 	}
+	*/
 }
 
 
 void AUTeamArenaGame::CallMatchStateChangeNotify()
 {
+	UE_LOG(LogGameMode, Log, TEXT("Current matchstate: %s"), *GetMatchState().ToString());
 	// This function intercepts all SetMatchState calls
 	// and routes them to our custom handlers.
+	if (GetMatchState() == MatchState::WaitingToStart)
+	{
+		bWarmupMode = true;
 
-	if (GetMatchState() == MatchState::MatchIntermission)
+	}
+	else if (GetMatchState() == MatchState::PlayerIntro)
+	{
+		// Ensure warmup mode is disabled once match is starting
+		bWarmupMode = false;
+	}
+	if (GetMatchState() == MatchState::MatchIntermission || GetMatchState() == FName(TEXT("RoundCooldown")))
 	{
 		HandleMatchIntermission();
 	}
@@ -208,7 +257,7 @@ void AUTeamArenaGame::CallMatchStateChangeNotify()
 
 void AUTeamArenaGame::DeferredHandleMatchStart()
 {
-	if (GetGameState<AURArenaGameState>())
+	if (GetGameState<AUTGameState>())
 	{
 		// Call HandleMatchHasStarted, which will call StartIntermission
 		// This mimics the PIE-safe flow
@@ -231,32 +280,43 @@ void AUTeamArenaGame::DeferredCheckRoundWinConditions()
 
 void AUTeamArenaGame::DefaultTimer()
 {
-	Super::DefaultTimer();
+	
+	if (IsPendingKill() || HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed))
+		return;
 
-	AURArenaGameState* GS = GetGameState<AURArenaGameState>();
-	if (GS == nullptr) return; // Not ready yet
 
-	// --- Intermission Logic ---
-	if (GS->GetMatchState() == MatchState::MatchIntermission)
+
+	AUTGameState* GS = GetWorld()->GetGameState<AUTGameState>();
+	if (GS == nullptr || GS->IsPendingKill() || GetWorld()->bIsTearingDown) return; // Not ready yet
+
+	//Because we don't call super defaulttimer except when roundinprogress. Need to do server management work here
+	HandleServerManagement();
+
+
+	// --- Intermission Logic-- -
+	if (GS->GetMatchState() == MatchState::MatchIntermission || GetMatchState() == FName(TEXT("RoundCooldown")))
 	{
 		if (IntermissionSecondsRemaining > 0)
 		{
 			--IntermissionSecondsRemaining;
-			GS->IntermissionSecondsRemaining = (uint8)IntermissionSecondsRemaining;
 
+			BP_OnSetIntermission(/*bInIntermission*/true, IntermissionSecondsRemaining);
 			// Broadcast 3, 2, 1
 			if (IntermissionSecondsRemaining > 0 && IntermissionSecondsRemaining <= 3)
 			{
 				BroadcastLocalized(this, UUTCountDownMessage::StaticClass(), IntermissionSecondsRemaining, nullptr, nullptr, nullptr);
 			}
+		}
 
-			if (IntermissionSecondsRemaining <= 0)
-			{
-				UE_LOG(LogGameMode, Log, TEXT("DefaultTimer: Intermission complete. Cleaning world and setting state to InProgress."));
-				// Intermission is over. Clean up items and start the round.
-				CleanupWorldForNewRound();
-				SetMatchState(MatchState::InProgress);
-			}
+		else // Intermission timer hit zero
+		{
+			// Notify BP that intermission is over (optional)
+			BP_OnSetIntermission(/*bInIntermission*/false, IntermissionSecondsRemaining);
+			CleanupWorldForNewRound();
+			SetMatchState(MatchState::InProgress);
+			UE_LOG(LogGameMode, Log, TEXT("DefaultTimer: Intermission complete. Cleaning world and setting state to InProgress."));
+
+
 		}
 		return;
 	}
@@ -268,7 +328,18 @@ void AUTeamArenaGame::DefaultTimer()
 		if (RoundEndTimeSeconds > 0.f)
 		{
 			RoundRemain = FMath::Max(0, (int32)FMath::CeilToInt(RoundEndTimeSeconds - GetWorld()->GetTimeSeconds()));
-			GS->RoundSecondsRemaining = RoundRemain;
+
+			/*if (GS->GetClass()->ImplementsInterface(URoundStateProvider::StaticClass()))
+				
+					IRoundStateProvider::Execute_Arena_SetRound(
+						GS,
+						//bInProgress true,
+						//RoundRemain RoundRemain,
+						//LastWinnerTeamIndex INDEX_NONE  // or cached Winner if you track it
+					);
+			*/
+			BP_OnSetRound(true, RoundRemain, LastRoundWinningTeamIndex);
+			
 
 			if (RoundRemain == 0)
 			{
@@ -311,9 +382,158 @@ void AUTeamArenaGame::DefaultTimer()
 
 		// Time has not run out, so check for eliminations normally.
 		CheckRoundWinConditions();
+		Super::DefaultTimer();
 	}
 }
 
+
+
+
+void AUTeamArenaGame::HandleServerManagement()
+{
+	// 1. Instance cleanup logic
+	HandleInstanceCleanup();
+
+	// 2. Map voting logic
+	HandleMapVoting();
+
+	// 3. Bot management (from UTGameMode::DefaultTimer)
+	CheckBotCount();
+
+	// 4. REMOVED: Force respawn logic - not needed for round-based gameplay
+	// Your spawn control in RestartPlayer() already prevents unwanted spawning
+}
+
+// NEW: Handle map voting logic (from Epic's UTGameMode::DefaultTimer)
+void AUTeamArenaGame::HandleMapVoting()
+{
+	if (MatchState == MatchState::MapVoteHappening)
+	{
+		if (GetWorld()->GetNetMode() != NM_Standalone)
+		{
+			UTGameState->VoteTimer--;
+			if (UTGameState->VoteTimer <= 0)
+			{
+				UTGameState->VoteTimer = 0;
+			}
+		}
+
+		// Scan the maps and see if we have a winner
+		TArray<AUTReplicatedMapInfo*> Best;
+		for (int32 i = 0; i < UTGameState->MapVoteList.Num(); i++)
+		{
+			if (UTGameState->MapVoteList[i]->VoteCount > 0)
+			{
+				if (Best.Num() == 0 || Best[0]->VoteCount < UTGameState->MapVoteList[i]->VoteCount)
+				{
+					Best.Empty();
+					Best.Add(UTGameState->MapVoteList[i]);
+				}
+			}
+		}
+
+		if (Best.Num() > 0)
+		{
+			int32 Target = int32(float(GetNumPlayers()) * 0.5);
+			if (Best[0]->VoteCount > Target)
+			{
+				TallyMapVotes();
+			}
+		}
+	}
+}
+
+
+void AUTeamArenaGame::HandleInstanceCleanup()
+{
+	// 1. Hub instance cleanup
+	if (IsGameInstanceServer() && LobbyBeacon)
+	{
+		// Update lobby stats periodically
+		if (GetWorld()->GetTimeSeconds() - LastLobbyUpdateTime >= 10.0f)
+		{
+			UpdateLobbyMatchStats();
+		}
+
+		if (!bDedicatedInstance)
+		{
+			// Empty server timeout
+			if (!HasMatchStarted())
+			{
+				if (GetWorld()->GetRealTimeSeconds() > LobbyInitialTimeoutTime && NumPlayers <= 0 &&
+					(GetNetDriver() == NULL || GetNetDriver()->ClientConnections.Num() == 0))
+				{
+					UE_LOG(LogGameMode, Warning, TEXT("Instance timeout - shutting down"));
+					ShutdownGameInstance();
+					return;
+				}
+			}
+			else
+			{
+				if (NumPlayers <= 0)
+				{
+					UE_LOG(LogGameMode, Warning, TEXT("Instance empty - shutting down"));
+					ShutdownGameInstance();
+					return;
+				}
+			}
+
+			// Idle player check
+			if (!bIgnoreIdlePlayers && UTGameState && UTGameState->IsMatchInProgress())
+			{
+				bool bAllPlayersAreIdle = true;
+				for (int32 i = 0; i < UTGameState->PlayerArray.Num(); i++)
+				{
+					AUTPlayerState* UTPlayerState = Cast<AUTPlayerState>(UTGameState->PlayerArray[i]);
+					if (UTPlayerState && !IsPlayerIdle(UTPlayerState))
+					{
+						bAllPlayersAreIdle = false;
+						break;
+					}
+				}
+
+				if (bAllPlayersAreIdle)
+				{
+					UE_LOG(LogGameMode, Warning, TEXT("All players idle - shutting down"));
+					ShutdownGameInstance();
+					return;
+				}
+			}
+		}
+	}
+	else
+	{
+		// 2. Non-hub server cleanup
+		if (NumPlayers <= 0 && NumSpectators <= 0 && HasMatchStarted())
+		{
+			EmptyServerTime++;
+			if (EmptyServerTime >= AutoRestartTime)
+			{
+				UE_LOG(LogGameMode, Warning, TEXT("Empty server timeout - restarting"));
+				TravelToNextMap();
+				return;
+			}
+		}
+		else
+		{
+			EmptyServerTime = 0;
+		}
+	}
+
+	// 3. Hub beacon connection monitoring
+	if (LobbyBeacon && LobbyBeacon->GetNetConnection()->State == EConnectionState::USOCK_Closed)
+	{
+		if (!bDedicatedInstance && NumPlayers <= 0 && MatchState != MatchState::WaitingToStart)
+		{
+			UE_LOG(LogGameMode, Warning, TEXT("Lost hub connection and server empty - shutting down"));
+			FPlatformMisc::RequestExit(false);
+			return;
+		}
+
+		// Try to reconnect
+		RecreateLobbyBeacon();
+	}
+}
 
 
 /**
@@ -330,10 +550,9 @@ void AUTeamArenaGame::HandleMatchIntermission()
 
 
 	// Force losers to view winners (if LastRoundWinningTeamIndex is set)
-	if (AURArenaGameState* GS = GetGameState<AURArenaGameState>())
-	{
-		ForceLosersToViewWinners(GS->LastRoundWinningTeamIndex);
-	}
+	int32 WinnerIdx = LastRoundWinningTeamIndex;
+
+	ForceLosersToViewWinners(WinnerIdx);
 }
 
 
@@ -353,20 +572,21 @@ void AUTeamArenaGame::StartIntermission(int32 Seconds)
 	StopOvertime();
 
 	// PIE-SAFETY CHECK: Only update GameState if it's the correct class
-	if (AURArenaGameState* GS = GetGameState<AURArenaGameState>())
+	if (AUTGameState* GS = GetGameState<AUTGameState>())
 	{
-		GS->bRoundInProgress = false;
-		GS->IntermissionSecondsRemaining = (uint8)IntermissionSecondsRemaining;
+		BP_OnSetIntermission(true, IntermissionSecondsRemaining);
+
+		// Optionally push a network update to clients anyway
 		GS->ForceNetUpdate();
 	}
 	else
 	{
-		UE_LOG(LogGameMode, Warning, TEXT("StartIntermission: AURArenaGameState is NULL. State will not be replicated."));
+		UE_LOG(LogGameMode, Warning, TEXT("StartIntermission: GameState is NULL. State will not be replicated."));
 	}
 
 	// This is the key: Set the match state.
 	// This will trigger CallMatchStateChangeNotify -> HandleMatchIntermission
-	SetMatchState(MatchState::MatchIntermission);
+	SetMatchState(FName(TEXT("RoundCooldown")));//MatchIntermission);
 }
 
 /**
@@ -398,8 +618,6 @@ void AUTeamArenaGame::StartNextRound()
 	Team0RoundDamage = 0.0f;
 	Team1RoundDamage = 0.0f;
 	PlayerRoundDamage.Empty();
-
-	// 1. Reset all player pawns from the *previous* round
 	ResetPlayersForNewRound();
 
 	// 2. Spawn players for the *new* round
@@ -455,13 +673,12 @@ void AUTeamArenaGame::StartNextRound()
 	// 4. Set final round state
 	bRoundInProgress = true;
 
-	// 5. Update GameState
-	if (AURArenaGameState* GS = GetWorld()->GetGameState<AURArenaGameState>())
+	if (AUTGameState* GS = GetWorld()->GetGameState<AUTGameState>())
 	{
-		GS->bRoundInProgress = true;
-		GS->RoundSecondsRemaining = (uint8)RoundTimeSeconds;
-		GS->IntermissionSecondsRemaining = 0; // Ensure intermission is over
-		GS->LastRoundWinningTeamIndex = INDEX_NONE; // Clear winner
+		
+		BP_OnSetRound(true, RoundTimeSeconds, LastRoundWinningTeamIndex);
+		BP_OnSetIntermission(false, 0);
+		// Still fine to force a net update on the base GameState
 		GS->ForceNetUpdate();
 	}
 
@@ -476,7 +693,7 @@ void AUTeamArenaGame::StartNextRound()
 		InitialWinCheckHandle, this,
 		&AUTeamArenaGame::DelayedInitialWinCheck, 0.25f, false);
 
-	UE_LOG(LogGameMode, Warning, TEXT("New round started. Manually attempted to spawn %d players."), PlayersSpawned);
+	//UE_LOG(LogGameMode, Warning, TEXT("New round started. Manually attempted to spawn %d players."), PlayersSpawned);
 }
 
 
@@ -495,6 +712,10 @@ void AUTeamArenaGame::EndRoundForTeam(int32 WinnerTeamIndex, FName Reason)
 	bRoundInProgress = false;
 	RoundEndTimeSeconds = 0.f;
 	LastRoundWinningTeamIndex = WinnerTeamIndex;
+	
+	// Increment total rounds counter (includes wins and draws)
+	TotalRoundsPlayed++;
+
 	// Stop overtime if it's running
 	StopOvertime();
 
@@ -530,10 +751,10 @@ void AUTeamArenaGame::EndRoundForTeam(int32 WinnerTeamIndex, FName Reason)
 	// --- Game is NOT over, proceed to intermission ---
 
 	// Update GameState with winner for this intermission
-	if (AURArenaGameState* GS = GetGameState<AURArenaGameState>())
+	if (AUTGameState* GS = GetGameState<AUTGameState>())
 	{
-		GS->bRoundInProgress = false;
-		GS->LastRoundWinningTeamIndex = WinnerTeamIndex;
+		BP_OnSetRound(false, 0, LastRoundWinningTeamIndex);
+		// Replication push — still valid on the base class
 		GS->ForceNetUpdate();
 	}
 
@@ -576,6 +797,7 @@ void AUTeamArenaGame::ResetPlayersForNewRound()
 		{
 			// Only reset OutOfLives, other flags are handled in StartNextRound
 			PS->SetOutOfLives(false);
+			PS->RoundDamageDone = 0;
 			PS->RoundKills = 0;
 		}
 
@@ -607,68 +829,99 @@ void AUTeamArenaGame::CleanupWorldForNewRound()
 			IUTResetInterface::Execute_Reset(*It);
 		}
 	}
+	for (FConstPawnIterator It = GetWorld()->GetPawnIterator(); It; ++It)
+	{
+		if (AUTCharacter* UTC = Cast<AUTCharacter>(It->Get()))
+		{
+			if (UTC->IsDead() && !UTC->IsPendingKill())
+			{
+				UTC->Destroy();
+			}
+		}
+	}
 }
 
 
-/*
- *
- * --- NO CHANGES NEEDED TO FUNCTIONS BELOW THIS LINE ---
- * (They are provided for context and completeness)
- *
- */
-
- // ... (Rest of your functions: RestartPlayer, ScoreKill_Implementation, GetAliveCounts, CheckLastManStanding, etc.) ...
- // ... (These functions are already correct or were fixed in the previous step and don't need changes for the new state logic) ...
-
- // [The rest of TeamArenaGame.cpp follows]
-
- // Example: Your existing RestartPlayer (no changes needed)
 void AUTeamArenaGame::RestartPlayer(AController* NewPlayer)
 {
 	// Always log the attempt
-	UE_LOG(LogGameMode, Warning, TEXT("RestartPlayer called for %s, bRoundInProgress=%s"),
-		NewPlayer ? *NewPlayer->GetName() : TEXT("NULL"),
-		bRoundInProgress ? TEXT("true") : TEXT("false"));
+	//UE_LOG(LogGameMode, Warning, TEXT("RestartPlayer called for %s, bRoundInProgress=%s"),
+		//NewPlayer ? *NewPlayer->GetName() : TEXT("NULL"),
+		//bRoundInProgress ? TEXT("true") : TEXT("false"));
 	if (!NewPlayer) return;
+
+	if (APlayerController* PC = Cast<APlayerController>(NewPlayer))
+	{
+		if (MustSpectate(PC))
+		{
+			UE_LOG(LogGameMode, Verbose, TEXT("RestartPlayer: Skipping spectator-only player %s"),
+				PC->PlayerState ? *PC->PlayerState->PlayerName : TEXT("Unknown"));
+			return;
+		}
+	}
 
 	// Skip if they already have a pawn (protect mid-equip)
 	if (NewPlayer->GetPawn())
 	{
-		UE_LOG(LogGameMode, Warning, TEXT("  Controller already has pawn; skipping respawn"));
+		//UE_LOG(LogGameMode, Warning, TEXT("  Controller already has pawn; skipping respawn"));
 		return;
 	}
-	if (NewPlayer && NewPlayer->PlayerState)
-	{
-		UE_LOG(LogGameMode, Warning, TEXT("  PlayerState: %s"), *NewPlayer->PlayerState->GetName());
-	}
+	//if (NewPlayer && NewPlayer->PlayerState)
+	//{
+		//UE_LOG(LogGameMode, Warning, TEXT("  PlayerState: %s"), *NewPlayer->PlayerState->GetName());
+	//}
+	AUTGameState* GS = GetGameState<AUTGameState>();
 
-	const bool bShouldAllowSpawn = (bAllowRespawnMidRound || bAllowPlayerRespawns || bWarmupMode);
-	UE_LOG(LogGameMode, Warning, TEXT("  bAllowRespawnMidRound=%s, bAllowPlayerRespawns=%s, bShouldAllowSpawn=%s"),
-		bAllowRespawnMidRound ? TEXT("true") : TEXT("false"),
-		bAllowPlayerRespawns ? TEXT("true") : TEXT("false"),
-		bShouldAllowSpawn ? TEXT("true") : TEXT("false"));
+	// Check if the lineup system is active.
+	// This check is from the base AUTGameMode::RestartPlayer
+	bool bLineupIsActive = (GS && GS->ActiveLineUpHelper && GS->ActiveLineUpHelper->bIsPlacingPlayers);
+
+	if (bLineupIsActive)
+	{
+		Super::RestartPlayer(NewPlayer);
+		return;
+	}
+	// The new logic: Allow spawn if (it's for a lineup) OR (it's for your round)
+	//const bool bShouldAllowSpawn = bLineupIsActive || bShouldAllowSpawnInRound;
+	// ForceRespawnTime will still work during warmup and pre-match phases
+	//bool hasStarted = HasMatchStarted();
+	const bool bShouldAllowSpawn = (bAllowRespawnMidRound || bAllowPlayerRespawns || bWarmupMode || GetMatchState() == MatchState::WaitingToStart);
+
+	//UE_LOG(LogGameMode, Warning, TEXT("  bAllowRespawnMidRound=%s, bAllowPlayerRespawns=%s, bShouldAllowSpawn=%s"),
+		//bAllowRespawnMidRound ? TEXT("true") : TEXT("false"),
+		//bAllowPlayerRespawns ? TEXT("true") : TEXT("false"),
+		//bShouldAllowSpawn ? TEXT("true") : TEXT("false"));
 
 
 	if (bShouldAllowSpawn)
 	{
-		AActor* ChosenStart = ChoosePlayerStart(NewPlayer);
-		UE_LOG(LogGameMode, Warning, TEXT("  Chosen PlayerStart: %s"),
+		// FIX: Call your ChoosePlayerStart and actually use the result
+		AActor* ChosenStart = ChoosePlayerStart_Implementation(NewPlayer);
+		UE_LOG(LogGameMode, Warning, TEXT("RestartPlayer: Chosen PlayerStart: %s"),
 			ChosenStart ? *ChosenStart->GetName() : TEXT("NULL"));
-
-		Super::RestartPlayer(NewPlayer);
+		//bSetPlayerDefaultsNewSpawn = true;
+		if (ChosenStart)
+		{
+			// Use RestartPlayerAtPlayerStart to ensure we use YOUR chosen spawn point
+			//RestartPlayerAtPlayerStart(NewPlayer, ChosenStart);
+			Super::RestartPlayer(NewPlayer);
+		}
+		/*else
+		{
+			// Fallback to base logic if no spawn found
+			Super::RestartPlayer(NewPlayer);
+		}*/
 
 		if (NewPlayer && NewPlayer->GetPawn())
 		{
-			UE_LOG(LogGameMode, Warning, TEXT("  Successfully spawned pawn: %s"), *NewPlayer->GetPawn()->GetClass()->GetName());
+			//return;
 		}
 		else
 		{
-			UE_LOG(LogGameMode, Warning, TEXT("  FAILED to spawn pawn!"));
+			if (!bLineupIsActive || !bWarmupMode) {
+				UE_LOG(LogGameMode, Warning, TEXT("RestartPlayer: FAILED to spawn pawn!"));
+			}
 		}
-	}
-	else
-	{
-		UE_LOG(LogGameMode, Warning, TEXT("  RestartPlayer blocked (mid-round respawn disabled)"));
 	}
 }
 
@@ -680,6 +933,7 @@ void AUTeamArenaGame::ScoreKill_Implementation(AController* Killer, AController*
 
 	if (GetMatchState() != MatchState::InProgress || !bRoundInProgress)
 		return;
+
 
 	AUTPlayerState* OtherPS = Other ? Cast<AUTPlayerState>(Other->PlayerState) : nullptr;
 	if (!OtherPS) return;
@@ -711,7 +965,7 @@ void AUTeamArenaGame::ScoreKill_Implementation(AController* Killer, AController*
 			// --- THIS IS THE CHANGE ---
 			// Don't call ForceTeamSpectate immediately.
 			// Set a timer to call it after SpectateDelay.
-			UE_LOG(LogGameMode, Warning, TEXT("ScoreKill: Round continues. Setting timer for DelayedForceSpectate in %.1f sec."), SpectateDelay);
+			//UE_LOG(LogGameMode, Warning, TEXT("ScoreKill: Round continues. Setting timer for DelayedForceSpectate in %.1f sec."), SpectateDelay);
 			
 			FTimerHandle TimerHandle_SpectateDelay;
 			FTimerDelegate SpectateDelegate;
@@ -745,27 +999,21 @@ void AUTeamArenaGame::DelayedForceSpectate(AUTPlayerState* DeadPS)
 	// 3. Check if the round ended *during* our delay
 	if (!bRoundInProgress)
 	{
-		UE_LOG(LogGameMode, Log, TEXT("DelayedForceSpectate: Round ended during delay. Aborting spectate."), *DeadPS->PlayerName);
+		//UE_LOG(LogGameMode, Log, TEXT("DelayedForceSpectate: Round ended during delay. Aborting spectate."), *DeadPS->PlayerName);
 		// EndRoundForTeam will handle their camera now
 		return;
 	}
 
 	// --- ALL CHECKS PASSED ---
-	UE_LOG(LogGameMode, Log, TEXT("DelayedForceSpectate: Delay complete. Forcing %s to spectate."), *DeadPS->PlayerName);
+	//UE_LOG(LogGameMode, Log, TEXT("DelayedForceSpectate: Delay complete. Forcing %s to spectate."), *DeadPS->PlayerName);
 	ForceTeamSpectate(DeadPS);
 }
 
-// --- This line is just to show where the other functions would be ---
-#pragma region "--- NO OTHER CHANGES NEEDED BELOW THIS LINE ---"
+
 
 AActor* AUTeamArenaGame::ChoosePlayerStart_Implementation(AController* Player)
 {
-	// Initialize system if needed
-	if (!bSpawnPointsInitialized)
-	{
-		InitializeSpawnPointSystem();
-		bSpawnPointsInitialized = true;
-	}
+
 
 	// Get player's team
 	AUTPlayerState* PS = Player ? Cast<AUTPlayerState>(Player->PlayerState) : nullptr;
@@ -855,7 +1103,7 @@ AActor* AUTeamArenaGame::ChoosePlayerStart_Implementation(AController* Player)
 			FVector OffsetLocation = FindSafeSpawnOffset(ChosenSpawn, Attempt);
 			if (IsLocationClearOfPlayers(OffsetLocation))
 			{
-				UE_LOG(LogGameMode, Log, TEXT("Using offset spawn location for %s (attempt %d)"), *PS->PlayerName, Attempt);
+				//UE_LOG(LogGameMode, Log, TEXT("Using offset spawn location for %s (attempt %d)"), *PS->PlayerName, Attempt);
 				break;
 			}
 		}
@@ -866,6 +1114,21 @@ AActor* AUTeamArenaGame::ChoosePlayerStart_Implementation(AController* Player)
 
 	return ChosenSpawn;
 }
+
+
+AActor* AUTeamArenaGame::FindPlayerStart_Implementation(AController* Player, const FString& IncomingName)
+{
+	// If we have an overridden player start (from RestartPlayer), use it
+	if (OverriddenPlayerStart)
+	{
+		return OverriddenPlayerStart;
+	}
+
+	// Otherwise use normal logic
+	return Super::FindPlayerStart_Implementation(Player, IncomingName);
+}
+
+
 
 void AUTeamArenaGame::InitializeSpawnPointSystem()
 {
@@ -947,9 +1210,38 @@ void AUTeamArenaGame::SelectOptimalSpawnPairForTeam(int32 TeamIndex)
 		}
 		return;
 	}
+	// NEW: Add randomization to prevent always picking the same pairs
+	// Shuffle candidates to introduce variety
+		for (int32 i = Candidates.Num() - 1; i > 0; i--)
+		{
+		int32 j = FMath::RandRange(0, i);
+			if (i != j)
+			{
+				Candidates.Swap(i, j);
+			}
+		}
 	APlayerStart* PrimarySpawn = nullptr;
 	APlayerStart* SecondarySpawn = nullptr;
-	FindMaxDistanceSpawnPair(Candidates, EnemySpawns, PrimarySpawn, SecondarySpawn);
+
+	// NEW: Use multiple selection strategies and rotate between them
+	int32 SelectionStrategy = CurrentRoundNumber % 3; // Rotate between 3 strategies
+
+	switch (SelectionStrategy)
+	{
+	case 0: // Distance-focused selection
+		FindMaxDistanceSpawnPair(Candidates, EnemySpawns, PrimarySpawn, SecondarySpawn);
+		break;
+
+	case 1: // Usage-focused selection (favor least used)
+		FindLeastUsedSpawnPair(Candidates, TeamIndex, PrimarySpawn, SecondarySpawn);
+		break;
+
+	case 2: // Balanced selection with random element
+		FindBalancedRandomSpawnPair(Candidates, EnemySpawns, TeamIndex, PrimarySpawn, SecondarySpawn);
+		break;
+	}
+
+	//FindMaxDistanceSpawnPair(Candidates, EnemySpawns, PrimarySpawn, SecondarySpawn);
 	if (PrimarySpawn)
 	{
 		SelectedSpawns.Add(PrimarySpawn);
@@ -980,6 +1272,8 @@ void AUTeamArenaGame::SelectOptimalSpawnPairForTeam(int32 TeamIndex)
 		SecondarySpawn ? *SecondarySpawn->GetName() : TEXT("None"));
 }
 
+
+/*
 void AUTeamArenaGame::FindMaxDistanceSpawnPair(const TArray<FSpawnPointData*>& CandidateSpawns, const TArray<APlayerStart*>& EnemySpawns, APlayerStart*& OutPrimary, APlayerStart*& OutSecondary)
 {
 	OutPrimary = nullptr;
@@ -1027,6 +1321,298 @@ void AUTeamArenaGame::FindMaxDistanceSpawnPair(const TArray<FSpawnPointData*>& C
 	}
 }
 
+
+void AUTeamArenaGame::FindMaxDistanceSpawnPair(const TArray<FSpawnPointData*>& CandidateSpawns, const TArray<APlayerStart*>& EnemySpawns, APlayerStart*& OutPrimary, APlayerStart*& OutSecondary)
+{
+	OutPrimary = nullptr;
+	OutSecondary = nullptr;
+	if (CandidateSpawns.Num() < 2)
+	{
+		if (CandidateSpawns.Num() == 1)
+		{
+			OutPrimary = CandidateSpawns[0]->PlayerStart;
+		}
+		return;
+	}
+
+	// Normalize weights to ensure they sum to 1.0
+	float TotalWeight = SpawnDistanceWeight + SpawnHeightWeight + SpawnUsageWeight + SpawnSeparationWeight;
+	float NormalizedDistanceWeight = (TotalWeight > 0.0f) ? SpawnDistanceWeight / TotalWeight : 0.25f;
+	float NormalizedHeightWeight = (TotalWeight > 0.0f) ? SpawnHeightWeight / TotalWeight : 0.25f;
+	float NormalizedUsageWeight = (TotalWeight > 0.0f) ? SpawnUsageWeight / TotalWeight : 0.25f;
+	float NormalizedSeparationWeight = (TotalWeight > 0.0f) ? SpawnSeparationWeight / TotalWeight : 0.25f;
+
+	float BestScore = -1.0f;
+	for (int32 i = 0; i < CandidateSpawns.Num(); ++i)
+	{
+		for (int32 j = i + 1; j < CandidateSpawns.Num(); ++j)
+		{
+			APlayerStart* Spawn1 = CandidateSpawns[i]->PlayerStart;
+			APlayerStart* Spawn2 = CandidateSpawns[j]->PlayerStart;
+			if (!Spawn1 || !Spawn2) continue;
+			float MinDist1 = CalculateMinDistanceToEnemySpawns(Spawn1, EnemySpawns);
+			float MinDist2 = CalculateMinDistanceToEnemySpawns(Spawn2, EnemySpawns);
+			float HeightScore1 = CandidateSpawns[i]->HeightScore;
+			float HeightScore2 = CandidateSpawns[j]->HeightScore;
+
+			// CHANGE: Increase the weight of usage score to encourage more variety
+			float UsageScore1 = 1.0f / (1.0f + CandidateSpawns[i]->GetUsageCountForTeam(0) + CandidateSpawns[i]->GetUsageCountForTeam(1));
+			float UsageScore2 = 1.0f / (1.0f + CandidateSpawns[j]->GetUsageCountForTeam(0) + CandidateSpawns[j]->GetUsageCountForTeam(1));
+
+			float SpawnSeparation = FVector::Dist(Spawn1->GetActorLocation(), Spawn2->GetActorLocation());
+			float SeparationScore = FMath::Min(SpawnSeparation / 1000.0f, 1.0f);
+
+			// CHANGE: Rebalance the weights to prioritize usage variety more
+			// Old: Distance=40%, Height=30%, Usage=20%, Separation=10%
+			// New: Distance=30%, Height=10%, Usage=45%, Separation=15%
+			//float CombinedScore = (MinDist1 + MinDist2) * 0.3f + (HeightScore1 + HeightScore2) * 0.10f + (UsageScore1 + UsageScore2) * 0.45f + SeparationScore * 0.15f;
+
+			float CombinedScore = (MinDist1 + MinDist2) * NormalizedDistanceWeight +
+				(HeightScore1 + HeightScore2) * NormalizedHeightWeight +
+				(UsageScore1 + UsageScore2) * NormalizedUsageWeight +
+				SeparationScore * NormalizedSeparationWeight;
+
+			if (CombinedScore > BestScore)
+			{
+				BestScore = CombinedScore;
+				if (HeightScore1 >= HeightScore2)
+				{
+					OutPrimary = Spawn1;
+					OutSecondary = Spawn2;
+				}
+				else
+				{
+					OutPrimary = Spawn2;
+					OutSecondary = Spawn1;
+				}
+			}
+		}
+	}
+}
+*/
+
+// IMPROVED: Modified version of existing function with dynamic weights
+void AUTeamArenaGame::FindMaxDistanceSpawnPair(const TArray<FSpawnPointData*>& CandidateSpawns, const TArray<APlayerStart*>& EnemySpawns, APlayerStart*& OutPrimary, APlayerStart*& OutSecondary)
+{
+	OutPrimary = nullptr;
+	OutSecondary = nullptr;
+
+	if (CandidateSpawns.Num() < 2)
+	{
+		if (CandidateSpawns.Num() == 1)
+		{
+			OutPrimary = CandidateSpawns[0]->PlayerStart;
+		}
+		return;
+	}
+
+	// NEW: Add some randomness to weights each round
+	float RandomVariation = 0.1f; // 10% variation
+	float CurrentDistanceWeight = SpawnDistanceWeight + FMath::FRandRange(-RandomVariation, RandomVariation);
+	float CurrentHeightWeight = SpawnHeightWeight + FMath::FRandRange(-RandomVariation, RandomVariation);
+	float CurrentUsageWeight = SpawnUsageWeight + FMath::FRandRange(-RandomVariation, RandomVariation);
+	float CurrentSeparationWeight = SpawnSeparationWeight + FMath::FRandRange(-RandomVariation, RandomVariation);
+
+	// Normalize weights
+	float TotalWeight = CurrentDistanceWeight + CurrentHeightWeight + CurrentUsageWeight + CurrentSeparationWeight;
+	CurrentDistanceWeight /= TotalWeight;
+	CurrentHeightWeight /= TotalWeight;
+	CurrentUsageWeight /= TotalWeight;
+	CurrentSeparationWeight /= TotalWeight;
+
+	float BestScore = -1.0f;
+	// FIX: Use a simpler structure instead of nested TPair
+	struct FSpawnPairScore
+	{
+		float Score;
+		int32 Index1;
+		int32 Index2;
+
+		FSpawnPairScore(float InScore, int32 InIndex1, int32 InIndex2)
+			: Score(InScore), Index1(InIndex1), Index2(InIndex2) {
+		}
+	};
+
+	TArray<FSpawnPairScore> ScoredPairs;
+
+	for (int32 i = 0; i < CandidateSpawns.Num(); ++i)
+	{
+		for (int32 j = i + 1; j < CandidateSpawns.Num(); ++j)
+		{
+			APlayerStart* Spawn1 = CandidateSpawns[i]->PlayerStart;
+			APlayerStart* Spawn2 = CandidateSpawns[j]->PlayerStart;
+			if (!Spawn1 || !Spawn2) continue;
+
+			float MinDist1 = CalculateMinDistanceToEnemySpawns(Spawn1, EnemySpawns);
+			float MinDist2 = CalculateMinDistanceToEnemySpawns(Spawn2, EnemySpawns);
+			float HeightScore1 = CandidateSpawns[i]->HeightScore;
+			float HeightScore2 = CandidateSpawns[j]->HeightScore;
+			float UsageScore1 = 1.0f / (1.0f + CandidateSpawns[i]->GetUsageCountForTeam(0) + CandidateSpawns[i]->GetUsageCountForTeam(1));
+			float UsageScore2 = 1.0f / (1.0f + CandidateSpawns[j]->GetUsageCountForTeam(0) + CandidateSpawns[j]->GetUsageCountForTeam(1));
+			float SpawnSeparation = FVector::Dist(Spawn1->GetActorLocation(), Spawn2->GetActorLocation());
+			float SeparationScore = FMath::Min(SpawnSeparation / 1000.0f, 1.0f);
+
+			float CombinedScore = (MinDist1 + MinDist2) * CurrentDistanceWeight +
+				(HeightScore1 + HeightScore2) * CurrentHeightWeight +
+				(UsageScore1 + UsageScore2) * CurrentUsageWeight +
+				SeparationScore * CurrentSeparationWeight;
+
+			// Add small random factor to break ties
+			CombinedScore += FMath::FRandRange(-0.01f, 0.01f);
+
+			ScoredPairs.Add(FSpawnPairScore(CombinedScore, i, j));
+		}
+	}
+
+	if (ScoredPairs.Num() > 0)
+	{
+		// Sort by score (descending)
+		ScoredPairs.Sort([](const FSpawnPairScore& A, const FSpawnPairScore& B)
+			{
+				return A.Score > B.Score;
+			});
+
+		// NEW: Instead of always picking the best, randomly select from top 3 pairs
+		int32 TopPairsToConsider = FMath::Min(3, ScoredPairs.Num());
+		int32 SelectedPairIndex = FMath::RandRange(0, TopPairsToConsider - 1);
+
+		const FSpawnPairScore& SelectedPair = ScoredPairs[SelectedPairIndex];
+
+		APlayerStart* Spawn1 = CandidateSpawns[SelectedPair.Index1]->PlayerStart;
+		APlayerStart* Spawn2 = CandidateSpawns[SelectedPair.Index2]->PlayerStart;
+
+		float HeightScore1 = CandidateSpawns[SelectedPair.Index1]->HeightScore;
+		float HeightScore2 = CandidateSpawns[SelectedPair.Index2]->HeightScore;
+
+		if (HeightScore1 >= HeightScore2)
+		{
+			OutPrimary = Spawn1;
+			OutSecondary = Spawn2;
+		}
+		else
+		{
+			OutPrimary = Spawn2;
+			OutSecondary = Spawn1;
+		}
+	}
+}
+
+
+void AUTeamArenaGame::FindLeastUsedSpawnPair(const TArray<FSpawnPointData*>& CandidateSpawns, int32 TeamIndex, APlayerStart*& OutPrimary, APlayerStart*& OutSecondary)
+{
+	OutPrimary = nullptr;
+	OutSecondary = nullptr;
+
+	if (CandidateSpawns.Num() < 2)
+	{
+		if (CandidateSpawns.Num() == 1)
+		{
+			OutPrimary = CandidateSpawns[0]->PlayerStart;
+		}
+		return;
+	}
+
+	// Sort by usage count (ascending) with some randomization
+	TArray<FSpawnPointData*> SortedCandidates = CandidateSpawns;
+	SortedCandidates.Sort([TeamIndex](const FSpawnPointData& A, const FSpawnPointData& B)
+		{
+			int32 UsageA = A.GetUsageCountForTeam(TeamIndex);
+			int32 UsageB = B.GetUsageCountForTeam(TeamIndex);
+
+			// If usage counts are equal, randomize
+			if (UsageA == UsageB)
+			{
+				return FMath::RandBool();
+			}
+			return UsageA < UsageB;
+		});
+
+	// Take the two least used spawns
+	OutPrimary = SortedCandidates[0]->PlayerStart;
+	if (SortedCandidates.Num() > 1)
+	{
+		OutSecondary = SortedCandidates[1]->PlayerStart;
+	}
+}
+
+// NEW: Balanced selection with randomization
+void AUTeamArenaGame::FindBalancedRandomSpawnPair(const TArray<FSpawnPointData*>& CandidateSpawns, const TArray<APlayerStart*>& EnemySpawns, int32 TeamIndex, APlayerStart*& OutPrimary, APlayerStart*& OutSecondary)
+{
+	OutPrimary = nullptr;
+	OutSecondary = nullptr;
+
+	if (CandidateSpawns.Num() < 2)
+	{
+		if (CandidateSpawns.Num() == 1)
+		{
+			OutPrimary = CandidateSpawns[0]->PlayerStart;
+		}
+		return;
+	}
+
+	// Create a weighted selection pool
+	TArray<float> SpawnScores;
+	SpawnScores.Reserve(CandidateSpawns.Num());
+
+	// Calculate scores for all candidates
+	for (const FSpawnPointData* SpawnData : CandidateSpawns)
+	{
+		if (!SpawnData || !SpawnData->PlayerStart) continue;
+
+		float MinDist = CalculateMinDistanceToEnemySpawns(SpawnData->PlayerStart, EnemySpawns);
+		float UsageScore = 1.0f / (1.0f + SpawnData->GetUsageCountForTeam(TeamIndex) + 1.0f); // +1 to avoid division issues
+		float HeightScore = SpawnData->HeightScore;
+
+		// Add some randomness to the score
+		float RandomFactor = FMath::FRandRange(0.8f, 1.2f);
+
+		float CombinedScore = (MinDist * 0.4f + UsageScore * 0.4f + HeightScore * 0.2f) * RandomFactor;
+		SpawnScores.Add(CombinedScore);
+	}
+
+	// Select top candidates with some randomness
+	int32 TopCandidatesCount = FMath::Min(6, CandidateSpawns.Num()); // Consider top 6 candidates
+
+	// Sort indices by score (descending)
+	TArray<int32> SortedIndices;
+	for (int32 i = 0; i < CandidateSpawns.Num(); i++)
+	{
+		SortedIndices.Add(i);
+	}
+
+	SortedIndices.Sort([&SpawnScores](const int32& A, const int32& B)
+		{
+			return SpawnScores[A] > SpawnScores[B];
+		});
+
+	// Randomly select from top candidates
+	int32 PrimaryIndex = SortedIndices[FMath::RandRange(0, FMath::Min(2, TopCandidatesCount - 1))]; // Top 3
+	OutPrimary = CandidateSpawns[PrimaryIndex]->PlayerStart;
+
+	// Select secondary from remaining top candidates
+	if (TopCandidatesCount > 1)
+	{
+		TArray<int32> RemainingIndices;
+		for (int32 i = 0; i < TopCandidatesCount; i++)
+		{
+			if (SortedIndices[i] != PrimaryIndex)
+			{
+				RemainingIndices.Add(SortedIndices[i]);
+			}
+		}
+
+		if (RemainingIndices.Num() > 0)
+		{
+			int32 SecondaryIndex = RemainingIndices[FMath::RandRange(0, FMath::Min(2, RemainingIndices.Num() - 1))];
+			OutSecondary = CandidateSpawns[SecondaryIndex]->PlayerStart;
+		}
+	}
+}
+
+
+
+
+
 float AUTeamArenaGame::CalculateMinDistanceToEnemySpawns(APlayerStart* SpawnPoint, const TArray<APlayerStart*>& EnemySpawns)
 {
 	if (!SpawnPoint || EnemySpawns.Num() == 0)
@@ -1046,6 +1632,7 @@ float AUTeamArenaGame::CalculateMinDistanceToEnemySpawns(APlayerStart* SpawnPoin
 	return (MinDistance == FLT_MAX) ? 10000.0f : MinDistance;
 }
 
+/*
 TArray<FSpawnPointData*> AUTeamArenaGame::GetSpawnCandidatesForTeam(int32 TeamIndex)
 {
 	TArray<FSpawnPointData*> Candidates;
@@ -1083,6 +1670,71 @@ FVector AUTeamArenaGame::FindSafeSpawnOffset(APlayerStart* BaseSpawn, int32 Atte
 	FVector TestLocation = BaseLocation + Offset;
 	return TestLocation;
 }
+*/
+FVector AUTeamArenaGame::FindSafeSpawnOffset(APlayerStart* BaseSpawn, int32 AttemptIndex)
+{
+	if (!BaseSpawn) return FVector::ZeroVector;
+	FVector BaseLocation = BaseSpawn->GetActorLocation();
+	float Angle = (AttemptIndex * 45.0f) * PI / 180.0f;
+	float Distance = SpawnOffsetDistance * (1.0f + AttemptIndex * 0.5f);
+	FVector Offset = FVector(FMath::Cos(Angle) * Distance, FMath::Sin(Angle) * Distance, 0.0f);
+	FVector TestLocation = BaseLocation + Offset;
+	return TestLocation;
+}
+
+// IMPROVED: Add randomization to candidate selection
+TArray<FSpawnPointData*> AUTeamArenaGame::GetSpawnCandidatesForTeam(int32 TeamIndex)
+{
+	TArray<FSpawnPointData*> Candidates;
+	for (FSpawnPointData& SpawnData : AllSpawnPoints)
+	{
+		if (!SpawnData.PlayerStart) continue;
+		bool bIsTeamSide = (TeamIndex == 0 && SpawnData.TeamSideScore <= 0.0f) || (TeamIndex == 1 && SpawnData.TeamSideScore >= 0.0f);
+		if (bIsTeamSide || FMath::Abs(SpawnData.TeamSideScore) < 0.2f)
+		{
+			Candidates.Add(&SpawnData);
+		}
+	}
+
+	// NEW: Don't always sort the same way - add randomization
+	int32 SortStrategy = CurrentRoundNumber % 2;
+
+	if (SortStrategy == 0)
+	{
+		// Usage-first sorting (original)
+		Candidates.Sort([TeamIndex](const FSpawnPointData& A, const FSpawnPointData& B)
+			{
+				int32 UsageA = A.GetUsageCountForTeam(TeamIndex);
+				int32 UsageB = B.GetUsageCountForTeam(TeamIndex);
+				if (UsageA != UsageB)
+				{
+					return UsageA < UsageB;
+				}
+				// Add randomness to break ties
+				return FMath::RandBool();
+			});
+	}
+	else
+	{
+		// Quality-first sorting with randomization
+		Candidates.Sort([TeamIndex](const FSpawnPointData& A, const FSpawnPointData& B)
+			{
+				float ScoreA = A.HeightScore + FMath::Abs(A.TeamSideScore);
+				float ScoreB = B.HeightScore + FMath::Abs(B.TeamSideScore);
+
+				// If scores are very close, randomize
+				if (FMath::Abs(ScoreA - ScoreB) < 0.1f)
+				{
+					return FMath::RandBool();
+				}
+				return ScoreA > ScoreB;
+			});
+	}
+
+	return Candidates;
+}
+
+
 
 bool AUTeamArenaGame::IsLocationClearOfPlayers(const FVector& Location, float CheckRadius)
 {
@@ -1108,7 +1760,7 @@ void AUTeamArenaGame::ResetSpawnSelectionForNewRound()
 	Team0SelectedSpawns.Empty();
 	Team1SelectedSpawns.Empty();
 	++CurrentRoundNumber;
-	UE_LOG(LogGameMode, Log, TEXT("ResetSpawnSelectionForNewRound: Starting round %d"), CurrentRoundNumber);
+	//UE_LOG(LogGameMode, Log, TEXT("ResetSpawnSelectionForNewRound: Starting round %d"), CurrentRoundNumber);
 }
 
 void AUTeamArenaGame::ForceTeamSpectate(AUTPlayerState* DeadPS)
@@ -1127,17 +1779,82 @@ void AUTeamArenaGame::ForceTeamSpectate(AUTPlayerState* DeadPS)
 	{
 		//PC->SetViewTarget(TeamTarget->GetUTCharacter());
 		PC->ServerViewPlayerState(TeamTarget);
+		PC->bSpectateBehindView = false;  // Force first person view
+		PC->BehindView(false);
 		return;
 	}
 	if (AUTPlayerState* EnemyTarget = FindAliveEnemy(DeadPS))
 	{
 		//PC->SetViewTarget(EnemyTarget->GetUTCharacter());
 		PC->ServerViewPlayerState(EnemyTarget);
+		PC->bSpectateBehindView = false;  // Force first person view
+		PC->BehindView(false);
 		return;
 	}
 	PC->ServerViewSelf();
 }
 
+AUTPlayerState* AUTeamArenaGame::FindAliveEnemy(AUTPlayerState* PS) const
+{
+	if (!PS || !PS->Team) return nullptr;
+
+	const int32 MyTeam = PS->Team->TeamIndex;
+
+	// Use team members to include both human players and bots
+	for (int32 TeamIdx = 0; TeamIdx < Teams.Num(); TeamIdx++)
+	{
+		if (TeamIdx == MyTeam || !Teams.IsValidIndex(TeamIdx)) continue;
+
+		TArray<AController*> Members = Teams[TeamIdx]->GetTeamMembers();
+		for (AController* C : Members)
+		{
+			if (!C) continue;
+
+			AUTPlayerState* OtherPS = Cast<AUTPlayerState>(C->PlayerState);
+			if (!OtherPS || OtherPS->bOnlySpectator) continue;
+
+			APawn* P = C->GetPawn();
+			AUTCharacter* UTC = Cast<AUTCharacter>(P);
+			if (P && (!UTC || !UTC->IsDead()))
+			{
+				return OtherPS;
+			}
+		}
+	}
+
+	return nullptr;
+}
+
+
+AUTPlayerState* AUTeamArenaGame::FindAliveTeammate(AUTPlayerState* PS) const
+{
+	if (!PS || !PS->Team) return nullptr;
+
+	const int32 TeamIdx = PS->Team->TeamIndex;
+	//if (!Teams.IsValidIndex(TeamIdx)) return nullptr;
+	if (!Teams.IsValidIndex(TeamIdx) || !Teams[TeamIdx]) return nullptr;
+
+	TArray<AController*> Members = Teams[TeamIdx]->GetTeamMembers();
+	for (AController* C : Members)
+	{
+		if (!C) continue;
+
+		AUTPlayerState* OtherPS = Cast<AUTPlayerState>(C->PlayerState);
+		if (!OtherPS || OtherPS == PS || OtherPS->bOnlySpectator) continue;
+
+		APawn* P = C->GetPawn();
+		AUTCharacter* UTC = Cast<AUTCharacter>(P);
+		if (P && (!UTC || !UTC->IsDead()))
+		{
+			return OtherPS;
+		}
+	}
+
+	return nullptr;
+}
+
+
+/*
 AUTPlayerState* AUTeamArenaGame::FindAliveTeammate(AUTPlayerState* PS) const
 {
 	if (!PS || !PS->Team) return nullptr;
@@ -1156,6 +1873,11 @@ AUTPlayerState* AUTeamArenaGame::FindAliveTeammate(AUTPlayerState* PS) const
 	}
 	return nullptr;
 }
+
+
+
+
+
 
 AUTPlayerState* AUTeamArenaGame::FindAliveEnemy(AUTPlayerState* PS) const
 {
@@ -1193,13 +1915,43 @@ int32 AUTeamArenaGame::CountAliveOnTeam(int32 TeamIndex) const
 	}
 	return Alive;
 }
+*/
+
+
+int32 AUTeamArenaGame::CountAliveOnTeam(int32 TeamIndex) const
+{
+	int32 Alive = 0;
+
+	// Use team members instead of just player controllers to include bots
+	if (Teams.IsValidIndex(TeamIndex) && Teams[TeamIndex])
+	{
+		TArray<AController*> Members = Teams[TeamIndex]->GetTeamMembers();
+		for (AController* C : Members)
+		{
+			if (!C) continue;
+
+			AUTPlayerState* PS = Cast<AUTPlayerState>(C->PlayerState);
+			if (!PS || PS->bOnlySpectator) continue;
+
+			const APawn* P = C->GetPawn();
+			const AUTCharacter* UTC = Cast<AUTCharacter>(P);
+			if (P && (!UTC || !UTC->IsDead()))
+			{
+				++Alive;
+			}
+		}
+	}
+
+	return Alive;
+}
+
 
 void AUTeamArenaGame::ForceLosersToViewWinners(int32 WinnerTeamIndex)
 {
-	UE_LOG(LogGameMode, Warning, TEXT("ForceLosersToViewWinners: Called with WinnerTeamIndex: %d"), WinnerTeamIndex);
+	//UE_LOG(LogGameMode, Warning, TEXT("ForceLosersToViewWinners: Called with WinnerTeamIndex: %d"), WinnerTeamIndex);
 	if (WinnerTeamIndex < 0)
 	{
-		UE_LOG(LogGameMode, Warning, TEXT("ForceLosersToViewWinners: Round was a draw. No view change."));
+		//UE_LOG(LogGameMode, Warning, TEXT("ForceLosersToViewWinners: Round was a draw. No view change."));
 		return;
 	}
 	const int32 LoserTeamIndex = (WinnerTeamIndex == 0) ? 1 : 0;
@@ -1207,7 +1959,7 @@ void AUTeamArenaGame::ForceLosersToViewWinners(int32 WinnerTeamIndex)
 	AUTPlayerState* TargetPS = FindAliveOnTeamPS(WinnerTeamIndex);
 	if (!TargetPS)
 	{
-		UE_LOG(LogGameMode, Warning, TEXT("ForceLosersToViewWinners: No alive winner found. Finding any winner..."));
+		//UE_LOG(LogGameMode, Warning, TEXT("ForceLosersToViewWinners: No alive winner found. Finding any winner..."));
 		TargetPS = FindAnyOnTeamPS(WinnerTeamIndex);
 		if (!TargetPS)
 		{
@@ -1218,11 +1970,11 @@ void AUTeamArenaGame::ForceLosersToViewWinners(int32 WinnerTeamIndex)
 	AUTCharacter* TargetCharacter = TargetPS->GetUTCharacter();
 	if (!TargetCharacter)
 	{
-		UE_LOG(LogGameMode, Warning, TEXT("ForceLosersToViewWinners: Target PlayerState %s has no character!"), *TargetPS->PlayerName);
+		//UE_LOG(LogGameMode, Warning, TEXT("ForceLosersToViewWinners: Target PlayerState %s has no character!"), *TargetPS->PlayerName);
 		return;
 	}
-	UE_LOG(LogGameMode, Warning, TEXT("ForceLosersToViewWinners: Found target character to spectate: %s (owned by %s)"),
-		*TargetCharacter->GetName(), *TargetPS->PlayerName);
+	//UE_LOG(LogGameMode, Warning, TEXT("ForceLosersToViewWinners: Found target character to spectate: %s (owned by %s)"),
+	//	*TargetCharacter->GetName(), *TargetPS->PlayerName);
 	for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
 	{
 		AUTPlayerController* PC = Cast<AUTPlayerController>(It->Get());
@@ -1230,13 +1982,13 @@ void AUTeamArenaGame::ForceLosersToViewWinners(int32 WinnerTeamIndex)
 		if (!PC || !PS || !PS->Team) continue;
 		if (PS->Team->TeamIndex == LoserTeamIndex)
 		{
-			UE_LOG(LogGameMode, Warning, TEXT("ForceLosersToViewWinners: Processing player %s. Current state: %s"),
-				*PS->PlayerName, PC->GetStateName().IsValid() ? *PC->GetStateName().ToString() : TEXT("Unknown"));
+			//UE_LOG(LogGameMode, Warning, TEXT("ForceLosersToViewWinners: Processing player %s. Current state: %s"),
+			//	*PS->PlayerName, PC->GetStateName().IsValid() ? *PC->GetStateName().ToString() : TEXT("Unknown"));
 			if (!PC->IsInState(NAME_Spectating))
 			{
 				PC->ChangeState(NAME_Spectating);
 				PC->ClientGotoState(NAME_Spectating);
-				UE_LOG(LogGameMode, Warning, TEXT("ForceLosersToViewWinners: Changed %s to spectating state"), *PS->PlayerName);
+				//UE_LOG(LogGameMode, Warning, TEXT("ForceLosersToViewWinners: Changed %s to spectating state"), *PS->PlayerName);
 			}
 			if (!PS->bOutOfLives)
 			{
@@ -1244,8 +1996,10 @@ void AUTeamArenaGame::ForceLosersToViewWinners(int32 WinnerTeamIndex)
 				PS->ForceNetUpdate();
 			}
 			PC->SetViewTarget(TargetCharacter);
-			UE_LOG(LogGameMode, Warning, TEXT("ForceLosersToViewWinners: Set %s to directly view character %s"),
-				*PS->PlayerName, *TargetCharacter->GetName());
+			PC->bSpectateBehindView = false;  // Force first person view
+			PC->BehindView(false);           // Apply the camera mode
+			//UE_LOG(LogGameMode, Warning, TEXT("ForceLosersToViewWinners: Set %s to directly view character %s"),
+			//	*PS->PlayerName, *TargetCharacter->GetName());
 		}
 	}
 }
@@ -1261,15 +2015,15 @@ void AUTeamArenaGame::DebugPlayerStates()
 		FName StateName = PC->GetStateName();
 		AActor* ViewTarget = PC->GetViewTarget();
 		FString ViewTargetName = ViewTarget ? ViewTarget->GetName() : TEXT("None");
-		UE_LOG(LogGameMode, Warning, TEXT("Player: %s, Team: %d, State: %s, ViewTarget: %s, OutOfLives: %s, HasPawn: %s"),
+		/*UE_LOG(LogGameMode, Warning, TEXT("Player: %s, Team: %d, State: %s, ViewTarget: %s, OutOfLives: %s, HasPawn: %s"),
 			*PS->PlayerName,
 			PS->Team ? PS->Team->TeamIndex : -1,
 			StateName.IsValid() ? *StateName.ToString() : TEXT("Unknown"),
 			*ViewTargetName,
 			PS->bOutOfLives ? TEXT("Yes") : TEXT("No"),
-			PC->GetPawn() ? TEXT("Yes") : TEXT("No"));
+			PC->GetPawn() ? TEXT("Yes") : TEXT("No")); */
 	}
-	UE_LOG(LogGameMode, Warning, TEXT("=== END DEBUG ==="));
+	//UE_LOG(LogGameMode, Warning, TEXT("=== END DEBUG ==="));
 }
 
 bool AUTeamArenaGame::CanSpectate_Implementation(APlayerController* Viewer, APlayerState* ViewTarget)
@@ -1307,6 +2061,7 @@ bool AUTeamArenaGame::CanSpectate_Implementation(APlayerController* Viewer, APla
 	return Super::CanSpectate_Implementation(Viewer, ViewTarget);
 }
 
+/*
 AUTPlayerState* AUTeamArenaGame::FindAliveOnTeamPS(int32 TeamIndex) const
 {
 	for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
@@ -1323,6 +2078,32 @@ AUTPlayerState* AUTeamArenaGame::FindAliveOnTeamPS(int32 TeamIndex) const
 	}
 	return nullptr;
 }
+*/
+
+
+AUTPlayerState* AUTeamArenaGame::FindAliveOnTeamPS(int32 TeamIndex) const
+{
+	if (!Teams.IsValidIndex(TeamIndex)) return nullptr;
+
+	TArray<AController*> Members = Teams[TeamIndex]->GetTeamMembers();
+	for (AController* C : Members)
+	{
+		if (!C) continue;
+
+		AUTPlayerState* PS = Cast<AUTPlayerState>(C->PlayerState);
+		if (!PS || PS->bOnlySpectator) continue;
+
+		APawn* P = C->GetPawn();
+		const AUTCharacter* UTC = Cast<AUTCharacter>(P);
+		if (P && (!UTC || !UTC->IsDead()))
+		{
+			return PS;
+		}
+	}
+
+	return nullptr;
+}
+
 
 AUTPlayerState* AUTeamArenaGame::FindAnyOnTeamPS(int32 TeamIndex) const
 {
@@ -1352,7 +2133,12 @@ bool AUTeamArenaGame::GetAliveCounts(int32& OutAliveTeam0, int32& OutAliveTeam1)
 	int32 NoTeam = 0;
 	int32 Spectators = 0;
 	int32 Inactive = 0;
-	AURArenaGameState* GS = GetGameState<AURArenaGameState>();
+	AUTGameState* GS = GetGameState<AUTGameState>();
+	if (GS == nullptr || GS->IsPendingKill())
+	{
+		// Don't log an error, this is normal during shutdown
+		return false;
+	}
 	if (!GS)
 	{
 		UE_LOG(LogGameMode, Error, TEXT("GetAliveCounts: Could not find GameState!"));
@@ -1402,18 +2188,37 @@ void AUTeamArenaGame::CheckLastManStanding(int32 Alive0, int32 Alive1)
 {
 	if (Team0StartingSize > 1 && Alive0 == 1 && !bTeam0LastManAnnounced)
 	{
-		BroadcastLastManStanding(0);
+		AUTPlayerState* ClutchPlayer = FindAliveOnTeamPS(0);
+		BroadcastLastManStanding(0, ClutchPlayer);
 		bTeam0LastManAnnounced = true;
+		if (ClutchPlayer)
+		{	// Broadcast the "clutch attempt" event
+			// Pass the player and the number of enemies they are facing (Alive1)
+			OnClutchSituationStarted.Broadcast(ClutchPlayer, Alive1);
+			UE_LOG(LogGameMode, Log, TEXT("Clutch Situation Started: %s (Team 0) vs %d enemies."), *ClutchPlayer->PlayerName, Alive1);
+		}
 	}
 	if (Team1StartingSize > 1 && Alive1 == 1 && !bTeam1LastManAnnounced)
 	{
-		BroadcastLastManStanding(1);
+		AUTPlayerState* ClutchPlayer = FindAliveOnTeamPS(1);
+		BroadcastLastManStanding(1, ClutchPlayer);
 		bTeam1LastManAnnounced = true;
+		if (ClutchPlayer)
+		{
+			// Broadcast the "clutch attempt" event
+			// Pass the player and the number of enemies they are facing (Alive0)
+			OnClutchSituationStarted.Broadcast(ClutchPlayer, Alive0);
+			UE_LOG(LogGameMode, Log, TEXT("Clutch Situation Started: %s (Team 1) vs %d enemies."), *ClutchPlayer->PlayerName, Alive0);
+		}
 	}
 }
 
-void AUTeamArenaGame::BroadcastLastManStanding(int32 LastManTeamIndex)
+void AUTeamArenaGame::BroadcastLastManStanding(int32 LastManTeamIndex, AUTPlayerState* LastManPlayerState)
 {
+	// Call Blueprint implementation first (for players without C++ plugin)
+	BP_OnLastManStanding(LastManTeamIndex, LastManPlayerState);
+
+	/* Then do C++ implementation for players with the plugin
 	if (!LastManStandingSound && !EnemyLastManStandingSound)
 	{
 		return;
@@ -1438,8 +2243,7 @@ void AUTeamArenaGame::BroadcastLastManStanding(int32 LastManTeamIndex)
 				PC->UTClientPlaySound(EnemyLastManStandingSound);
 			}
 		}
-	}
-	UE_LOG(LogGameMode, Log, TEXT("Last Man Standing: Team %d has only one player remaining"), LastManTeamIndex);
+	}*/
 }
 
 void AUTeamArenaGame::CheckRoundWinConditions()
@@ -1452,54 +2256,82 @@ void AUTeamArenaGame::CheckRoundWinConditions()
 	}
 	int32 Alive0, Alive1;
 	GetAliveCounts(Alive0, Alive1);
+	/*if (Team0StartingSize == 0 || Team1StartingSize == 0)
+	{
+		// One team is empty - let the timer run out naturally
+		return;
+	}*/
 	const bool Team0Eliminated = (Alive0 == 0);
 	const bool Team1Eliminated = (Alive1 == 0);
 	if (Team0Eliminated && !Team1Eliminated)
 	{
 		FTimerDelegate TimerDelegate;
 		TimerDelegate.BindUFunction(this, FName("DelayedEndRound"), 1, FName(TEXT("Elimination")));
-		GetWorldTimerManager().SetTimer(TH_RoundEndDelay, TimerDelegate, 1.0f, false);
+		GetWorldTimerManager().SetTimer(TH_RoundEndDelay, TimerDelegate, 0.2f, false);
 	}
 	else if (Team1Eliminated && !Team0Eliminated)
 	{
 		FTimerDelegate TimerDelegate;
 		TimerDelegate.BindUFunction(this, FName("DelayedEndRound"), 0, FName(TEXT("Elimination")));
-		GetWorldTimerManager().SetTimer(TH_RoundEndDelay, TimerDelegate, 1.0f, false);
+		GetWorldTimerManager().SetTimer(TH_RoundEndDelay, TimerDelegate, 0.2f, false);
 	}
 	else if (Team0Eliminated && Team1Eliminated)
 	{
 		FTimerDelegate TimerDelegate;
 		TimerDelegate.BindUFunction(this, FName("DelayedEndRound"), INDEX_NONE, FName(TEXT("Draw")));
-		GetWorldTimerManager().SetTimer(TH_RoundEndDelay, TimerDelegate, 1.0f, false);
+		GetWorldTimerManager().SetTimer(TH_RoundEndDelay, TimerDelegate, 0.2f, false);
 	}
 }
 
 void AUTeamArenaGame::BroadcastDomination(int32 DominatingTeamIndex)
 {
-	const int32 MessageIndex = (DominatingTeamIndex == 0) ? 3 : 4;
-	for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
-	{
-		if (AUTPlayerController* PC = Cast<AUTPlayerController>(It->Get()))
-		{
-			PC->ClientReceiveLocalizedMessage(UUTTeamArenaVictoryMessage::StaticClass(), MessageIndex, nullptr, nullptr, nullptr);
-		}
-	}
+	// Pure Blueprint implementation - let BP handle all audio/UI
+	BP_OnDomination(DominatingTeamIndex);
 }
 
 void AUTeamArenaGame::BroadcastTakesLead(int32 LeadingTeamIndex)
 {
-	const int32 MessageIndex = (LeadingTeamIndex == 0) ? 5 : 6;
-	for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
-	{
-		if (AUTPlayerController* PC = Cast<AUTPlayerController>(It->Get()))
-		{
-			PC->ClientReceiveLocalizedMessage(UUTTeamArenaVictoryMessage::StaticClass(), MessageIndex, nullptr, nullptr, nullptr);
-		}
-	}
+	// Pure Blueprint implementation - let BP handle all audio/UI
+	BP_OnTakesLead(LeadingTeamIndex);
 }
 
 void AUTeamArenaGame::BroadcastRoundResults(int32 WinnerTeamIndex, bool bIsDraw)
 {
+	// Call Blueprint implementation first (for players without C++ plugin)
+	bool bAllWinnersAlive = false;
+	if (!bIsDraw && WinnerTeamIndex >= 0)
+	{
+		// Get total team size and alive count for the winning team
+		int32 TotalWinningTeamSize = 0;
+		int32 AliveWinningTeamSize = 0;
+
+		if (Teams.IsValidIndex(WinnerTeamIndex))
+		{
+			TArray<AController*> WinnerMembers = Teams[WinnerTeamIndex]->GetTeamMembers();
+			for (AController* C : WinnerMembers)
+			{
+				AUTPlayerState* PS = Cast<AUTPlayerState>(C->PlayerState);
+				if (PS && !PS->bOnlySpectator)
+				{
+					TotalWinningTeamSize++;
+
+					// Check if this player is alive
+					APawn* P = C->GetPawn();
+					AUTCharacter* UTC = Cast<AUTCharacter>(P);
+					if (P && (!UTC || !UTC->IsDead()))
+					{
+						AliveWinningTeamSize++;
+					}
+				}
+			}
+		}
+
+		// All winners are alive if alive count equals total count and team isn't empty
+		bAllWinnersAlive = (TotalWinningTeamSize > 0 && AliveWinningTeamSize == TotalWinningTeamSize);
+	}
+	BP_OnRoundResults(WinnerTeamIndex, bIsDraw, bAllWinnersAlive);
+
+	/* Then do C++ implementation for players with the plugin
 	int32 MessageIndex;
 	if (bIsDraw)
 	{
@@ -1519,7 +2351,7 @@ void AUTeamArenaGame::BroadcastRoundResults(int32 WinnerTeamIndex, bool bIsDraw)
 		{
 			PC->ClientReceiveLocalizedMessage(UUTTeamArenaVictoryMessage::StaticClass(), MessageIndex, nullptr, nullptr, nullptr);
 		}
-	}
+	}*/
 }
 
 void AUTeamArenaGame::CheckRoundAchievements(int32 WinnerTeamIndex, FName Reason)
@@ -1533,6 +2365,7 @@ void AUTeamArenaGame::CheckRoundAchievements(int32 WinnerTeamIndex, FName Reason
 	CheckForHighDamageCarry(WinnerTeamIndex);
 }
 
+/*
 void AUTeamArenaGame::CheckForACE(int32 WinnerTeamIndex)
 {
 	int32 EnemyTeamIndex = (WinnerTeamIndex == 0) ? 1 : 0;
@@ -1577,6 +2410,73 @@ void AUTeamArenaGame::CheckForDarkHorse(int32 WinnerTeamIndex)
 		}
 	}
 }
+*/
+
+void AUTeamArenaGame::CheckForDarkHorse(int32 WinnerTeamIndex)
+{
+	int32 AliveWinners = CountAliveOnTeam(WinnerTeamIndex);
+	if (AliveWinners == 1)
+	{
+		// Check for dark horse using team members to include bots
+		if (Teams.IsValidIndex(WinnerTeamIndex))
+		{
+			TArray<AController*> WinnerMembers = Teams[WinnerTeamIndex]->GetTeamMembers();
+			for (AController* C : WinnerMembers)
+			{
+				if (!C) continue;
+
+				AUTPlayerState* PS = Cast<AUTPlayerState>(C->PlayerState);
+				if (!PS || PS->bOnlySpectator) continue;
+
+				AUTCharacter* Character = PS->GetUTCharacter();
+				if (Character && !Character->IsDead() && PS->RoundKills >= 2)
+				{
+					RecordDarkHorse(PS, PS->RoundKills);
+					break;
+				}
+			}
+		}
+	}
+}
+
+
+// For CheckForACE:
+void AUTeamArenaGame::CheckForACE(int32 WinnerTeamIndex)
+{
+	int32 EnemyTeamIndex = (WinnerTeamIndex == 0) ? 1 : 0;
+
+	// Count enemy team size using team members
+	int32 EnemyTeamSize = 0;
+	if (Teams.IsValidIndex(EnemyTeamIndex))
+	{
+		TArray<AController*> EnemyMembers = Teams[EnemyTeamIndex]->GetTeamMembers();
+		for (AController* C : EnemyMembers)
+		{
+			AUTPlayerState* PS = Cast<AUTPlayerState>(C->PlayerState);
+			if (PS && !PS->bOnlySpectator)
+			{
+				EnemyTeamSize++;
+			}
+		}
+	}
+
+	// Check for ACE using team members
+	if (Teams.IsValidIndex(WinnerTeamIndex))
+	{
+		TArray<AController*> WinnerMembers = Teams[WinnerTeamIndex]->GetTeamMembers();
+		for (AController* C : WinnerMembers)
+		{
+			AUTPlayerState* PS = Cast<AUTPlayerState>(C->PlayerState);
+			if (PS && PS->RoundKills >= EnemyTeamSize && EnemyTeamSize >= 2)
+			{
+				RecordACE(PS);
+				break;
+			}
+		}
+	}
+}
+
+
 
 void AUTeamArenaGame::CheckForHighDamageCarry(int32 WinnerTeamIndex)
 {
@@ -1585,12 +2485,12 @@ void AUTeamArenaGame::CheckForHighDamageCarry(int32 WinnerTeamIndex)
 	{
 		for (auto& DamagePair : PlayerRoundDamage)
 		{
-			AUTPlayerState* PS = DamagePair.Key;
+			AUTPlayerState* PS = DamagePair.Key.Get();
 			float PlayerDamage = DamagePair.Value;
-			if (PS && PS->Team && PS->Team->TeamIndex == WinnerTeamIndex)
+			if (PS && PS->Team && PS->Team->TeamIndex == WinnerTeamIndex && PlayerDamage > 440.f)
 			{
 				float DamagePercentage = (PlayerDamage / TeamTotalDamage) * 100.0f;
-				if (DamagePercentage >= 75.0f)
+				if (DamagePercentage >= HighDamageCarryThreshold)
 				{
 					RecordHighDamageCarry(PS, DamagePercentage);
 				}
@@ -1623,28 +2523,60 @@ void AUTeamArenaGame::RecordHighDamageCarry(AUTPlayerState* PlayerState, float D
 void AUTeamArenaGame::ScoreDamage_Implementation(int32 DamageAmount, AUTPlayerState* Victim, AUTPlayerState* Attacker)
 {
 	Super::ScoreDamage_Implementation(DamageAmount, Victim, Attacker);
-	if (bRoundInProgress && Attacker && Attacker->Team && DamageAmount > 0)
+	// Add the same safety checks as parent implementations
+	if (!Victim || !Attacker || !UTGameState)
 	{
+		return;
+	}
+
+	// Use the same team check pattern as parent implementations
+	if (UTGameState->OnSameTeam(Victim, Attacker))
+	{
+		// This is team damage, don't count it for achievements
+		return;
+	}
+
+	// Now safely proceed with damage tracking logic
+	if (!bRoundInProgress || !Attacker->Team || DamageAmount <= 0)
+	{
+		return;
+	}
+
+
+		// **NEW**: Calculate actual damage dealt (not overkill)
+		int32 ActualDamageDealt = DamageAmount;
+
+		if (Victim && Victim->GetUTCharacter())
+		{
+			AUTCharacter* VictimChar = Victim->GetUTCharacter();
+			int32 VictimHealth = VictimChar->Health;
+			float VictimArmor = VictimChar->GetArmorAmount();
+			int32 TotalVictimHP = VictimHealth + FMath::FloorToInt(VictimArmor);
+
+			// Cap damage at victim's actual health + armor
+			ActualDamageDealt = FMath::Min(DamageAmount, TotalVictimHP);
+		}
+
 		if (!PlayerRoundDamage.Contains(Attacker))
 		{
 			PlayerRoundDamage.Add(Attacker, 0.0f);
 		}
-		PlayerRoundDamage[Attacker] += DamageAmount;
+		PlayerRoundDamage[Attacker] += ActualDamageDealt; // Use actual damage, not overkill
 		if (Attacker->Team->TeamIndex == 0)
 		{
-			Team0RoundDamage += DamageAmount;
+			Team0RoundDamage += ActualDamageDealt;
 		}
 		else if (Attacker->Team->TeamIndex == 1)
 		{
-			Team1RoundDamage += DamageAmount;
+			Team1RoundDamage += ActualDamageDealt;
 		}
-	}
+
 }
 
 bool AUTeamArenaGame::ModifyDamage_Implementation(int32& Damage, FVector& Momentum, APawn* Injured, AController* InstigatedBy, const FHitResult& HitInfo, AActor* DamageCauser, TSubclassOf<UDamageType> DamageType)
 {
 	// Check for invulnerability during intermission
-	if (GetMatchState() == MatchState::MatchIntermission && Injured && Injured->PlayerState)
+	if (GetMatchState() == FName(TEXT("RoundCooldown")) && Injured && Injured->PlayerState)
 	{
 		AUTPlayerState* InjuredPS = Cast<AUTPlayerState>(Injured->PlayerState);
 		if (InjuredPS && InjuredPS->Team && InjuredPS->Team->TeamIndex == LastRoundWinningTeamIndex)
@@ -1655,7 +2587,7 @@ bool AUTeamArenaGame::ModifyDamage_Implementation(int32& Damage, FVector& Moment
 		}
 	}
 
-	// Apply standard team damage reduction
+	/* Apply standard team damage reduction
 	if (InstigatedBy != NULL && Injured && InstigatedBy != Injured->Controller && Cast<AUTGameState>(GameState)->OnSameTeam(Injured, InstigatedBy))
 	{
 		Damage *= TeamDamagePct;
@@ -1671,7 +2603,7 @@ bool AUTeamArenaGame::ModifyDamage_Implementation(int32& Damage, FVector& Moment
 			((AUTPlayerState*)(Injured->PlayerState))->AnnounceSameTeam(InstigatorPC);
 		}
 	}
-
+	*/
 	// Call parent *after* our logic
 	return Super::ModifyDamage_Implementation(Damage, Momentum, Injured, InstigatedBy, HitInfo, DamageCauser, DamageType);
 }
@@ -1786,7 +2718,7 @@ void AUTeamArenaGame::BroadcastOvertimeAnnouncement()
 			PC->UTClientPlaySound(OvertimeAnnouncementSound);
 		}
 	}
-	UE_LOG(LogGameMode, Warning, TEXT("Overtime announcement sound played to all players"));
+	//UE_LOG(LogGameMode, Warning, TEXT("Overtime announcement sound played to all players"));
 }
 
 void AUTeamArenaGame::ExecuteOvertimeWave()
@@ -1926,21 +2858,94 @@ void AUTeamArenaGame::CheckForDominationAndLead(int32 WinnerTeamIndex)
 	PreviousBlueScore = BlueScore;
 }
 
-
-void AUTeamArenaGame::EndPlay(const EEndPlayReason::Type EndPlayReason)
+void AUTeamArenaGame::BP_RestartCurrentRound()
 {
-	UE_LOG(LogGameMode, Log, TEXT("AUTeamArenaGame::EndPlay called. Clearing all active timers for this object."));
-
-	// This is the graceful shutdown you were missing.
-	// It tells the World's TimerManager to find and remove *all* timers
-	// that are currently bound to this GameMode object.
-	if (UWorld* World = GetWorld())
+	if (!HasAuthority())
 	{
-		World->GetTimerManager().ClearAllTimersForObject(this);
+		UE_LOG(LogGameMode, Warning, TEXT("BP_RestartCurrentRound: Only server can restart rounds"));
+		return;
 	}
 
-	// Always call the parent implementation
-	Super::EndPlay(EndPlayReason);
+	// Only allow round restart during a match (not in warmup or when match hasn't started)
+	if (bWarmupMode || !HasMatchStarted())
+	{
+		UE_LOG(LogGameMode, Warning, TEXT("BP_RestartCurrentRound: Cannot restart round - match not in progress"));
+		return;
+	}
+
+	UE_LOG(LogGameMode, Warning, TEXT("BP_RestartCurrentRound: Restarting current round due to admin request"));
+
+	// Stop any active overtime
+	StopOvertime();
+
+	// Clear any pending timers that might interfere
+	GetWorldTimerManager().ClearTimer(TH_RoundEndDelay);
+	GetWorldTimerManager().ClearTimer(InitialWinCheckHandle);
+
+	// Force end current round state immediately
+	bRoundInProgress = false;
+	RoundEndTimeSeconds = 0.f;
+
+	// Reset round-specific tracking without incrementing TotalRoundsPlayed
+	LastRoundWinningTeamIndex = INDEX_NONE;
+	bTeam0LastManAnnounced = false;
+	bTeam1LastManAnnounced = false;
+	Team0StartingSize = 0;
+	Team1StartingSize = 0;
+	Team0RoundDamage = 0.0f;
+	Team1RoundDamage = 0.0f;
+	PlayerRoundDamage.Empty();
+
+	// Clean up the world and reset players for the new round
+	ResetPlayersForNewRound();
+	CleanupWorldForNewRound();
+
+	// Reset spawn selection for the new round attempt
+	ResetSpawnSelectionForNewRound();
+
+	// Start a brief intermission before the new round (3 seconds)
+	StartIntermission(3);
+
+	// Broadcast a message to let everyone know the round was restarted
+	BroadcastLocalized(this, UUTGameMessage::StaticClass(), 10, nullptr, nullptr, nullptr); // You might want to create a custom message for this
+}
+
+void AUTeamArenaGame::Logout(AController* Exiting)
+{
+	if (Exiting)
+	{
+		AUTPlayerState* PS = Cast<AUTPlayerState>(Exiting->PlayerState);
+		if (PS)
+		{
+			// --- THIS IS THE FIX ---
+			// The PlayerState is about to be destroyed.
+			// We MUST remove it from our TMap to prevent
+			// stale pointer access.
+			PlayerRoundDamage.Remove(PS);
+
+		}
+	}
+
+	Super::Logout(Exiting);
+}
+
+
+void AUTeamArenaGame::InitGameState()
+{
+	Super::InitGameState();
+
+	// CRITICAL FIX: Only change GameModeClass on clients for compatibility
+	// Server needs to keep the real C++ class, but clients without the plugin
+	// need a fallback class they can load
+
+		if (AUTGameState* GS = GetGameState<AUTGameState>())
+		{
+			// Set GameModeClass to the parent class that all clients have
+			GS->GameModeClass = AUTTeamGameMode::StaticClass();
+
+			UE_LOG(LogGameMode, Warning, TEXT("InitGameState: - Set GameModeClass to UTTeamGameMode for compatibility"));
+		}
+
 }
 
 

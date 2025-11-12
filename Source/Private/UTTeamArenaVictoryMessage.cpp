@@ -1,4 +1,5 @@
 #include "TeamArena.h"
+#include "UnrealTournament.h"
 #include "UTTeamArenaVictoryMessage.h"
 #include "Sound/SoundBase.h"
 
@@ -88,6 +89,8 @@ FText UUTTeamArenaVictoryMessage::GetText(int32 Switch, bool bTargetsPlayerState
 			return RedTeamTakesLeadText;
 		case 6:
 			return BlueTeamTakesLeadText;
+		case 10:
+			return RoundDrawText;
 		default:
 			return FText();
 	}
