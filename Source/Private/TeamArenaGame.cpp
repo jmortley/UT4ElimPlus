@@ -179,22 +179,6 @@ void AUTeamArenaGame::BeginPlay()
 	// HandleMatchHasStarted will be called by the engine, which will call StartIntermission.
 }
 
-/*
-void AUTeamArenaGame::HandleMatchHasStarted()
-{
-	Super::HandleMatchHasStarted();
-
-	// This is the first time the match is starting.
-	// We start in Intermission to give players time to load in.
-	// We'll use the PreRoundCountdown as the initial "Get Ready" time.
-	if (AURArenaGameState* GS = GetGameState<AURArenaGameState>())
-	{
-		GS->bMatchHasStarted = true;
-	}
-
-	StartIntermission(PreRoundCountdown);
-}
-*/
 
 void AUTeamArenaGame::HandleMatchHasStarted()
 {
@@ -212,16 +196,7 @@ void AUTeamArenaGame::HandleMatchHasStarted()
 
 	Super::HandleMatchHasStarted();
 	bWarmupMode = false;
-	// This is the true start of the match.
-	// We start in intermission to prepare for Round 1.
-	/*
-	if (!GS->bMatchHasStarted)
-	{
-		UE_LOG(LogGameMode, Log, TEXT("HandleMatchHasStarted: Match is starting. Calling StartIntermission for the first round."));
-		GS->bMatchHasStarted = true;
-		StartIntermission(PreRoundCountdown);
-	}
-	*/
+
 }
 
 
@@ -568,7 +543,7 @@ void AUTeamArenaGame::HandleMatchIntermission()
 
 
 	// Reset spawn points for the new round
-	ResetSpawnSelectionForNewRound();
+	//ResetSpawnSelectionForNewRound();
 
 
 	// Force losers to view winners (if LastRoundWinningTeamIndex is set)
@@ -641,7 +616,8 @@ void AUTeamArenaGame::StartNextRound()
 	Team1RoundDamage = 0.0f;
 	PlayerRoundDamage.Empty();
 	ResetPlayersForNewRound();
-
+	ResetSpawnSelectionForNewRound();
+	DarkHorseCandidates.Empty();
 	// 2. Spawn players for the *new* round
 	bAllowPlayerRespawns = true; // Allow RestartPlayer to work
 	int32 PlayersSpawned = 0;
@@ -888,10 +864,7 @@ void AUTeamArenaGame::RestartPlayer(AController* NewPlayer)
 		//UE_LOG(LogGameMode, Warning, TEXT("  Controller already has pawn; skipping respawn"));
 		return;
 	}
-	//if (NewPlayer && NewPlayer->PlayerState)
-	//{
-		//UE_LOG(LogGameMode, Warning, TEXT("  PlayerState: %s"), *NewPlayer->PlayerState->GetName());
-	//}
+
 	AUTGameState* GS = GetGameState<AUTGameState>();
 
 	// Check if the lineup system is active.
@@ -903,8 +876,8 @@ void AUTeamArenaGame::RestartPlayer(AController* NewPlayer)
 		Super::RestartPlayer(NewPlayer);
 		return;
 	}
-	// The new logic: Allow spawn if (it's for a lineup) OR (it's for your round)
-	//const bool bShouldAllowSpawn = bLineupIsActive || bShouldAllowSpawnInRound;
+
+	//
 	// ForceRespawnTime will still work during warmup and pre-match phases
 	//bool hasStarted = HasMatchStarted();
 	const bool bShouldAllowSpawn = (bAllowRespawnMidRound || bAllowPlayerRespawns || bWarmupMode || GetMatchState() == MatchState::WaitingToStart);
@@ -921,12 +894,15 @@ void AUTeamArenaGame::RestartPlayer(AController* NewPlayer)
 		AActor* ChosenStart = ChoosePlayerStart_Implementation(NewPlayer);
 		UE_LOG(LogGameMode, Warning, TEXT("RestartPlayer: Chosen PlayerStart: %s"),
 			ChosenStart ? *ChosenStart->GetName() : TEXT("NULL"));
+
+		OverriddenPlayerStart = ChosenStart;
 		//bSetPlayerDefaultsNewSpawn = true;
 		if (ChosenStart)
 		{
 			// Use RestartPlayerAtPlayerStart to ensure we use YOUR chosen spawn point
 			//RestartPlayerAtPlayerStart(NewPlayer, ChosenStart);
 			Super::RestartPlayer(NewPlayer);
+			OverriddenPlayerStart = nullptr;
 		}
 		/*else
 		{
@@ -1042,13 +1018,15 @@ AActor* AUTeamArenaGame::ChoosePlayerStart_Implementation(AController* Player)
 	if (!PS)
 	{
 		UE_LOG(LogGameMode, Warning, TEXT("ChoosePlayerStart: PlayerState is NULL, using fallback"));
-		return Super::ChoosePlayerStart_Implementation(Player);
+		//return Super::ChoosePlayerStart_Implementation(Player);
+		return nullptr;
 	}
 
 	if (!PS->Team)
 	{
 		UE_LOG(LogGameMode, Warning, TEXT("ChoosePlayerStart: Player %s has no team, using fallback"), *PS->PlayerName);
-		return Super::ChoosePlayerStart_Implementation(Player);
+		//return Super::ChoosePlayerStart_Implementation(Player);
+		return nullptr;
 	}
 
 	const int32 TeamIndex = PS->Team->TeamIndex;
@@ -1143,10 +1121,11 @@ AActor* AUTeamArenaGame::FindPlayerStart_Implementation(AController* Player, con
 	// If we have an overridden player start (from RestartPlayer), use it
 	if (OverriddenPlayerStart)
 	{
+		UE_LOG(LogGameMode, Warning, TEXT("Using overriden playerstart"));
 		return OverriddenPlayerStart;
 	}
 
-	// Otherwise use normal logic
+	UE_LOG(LogGameMode, Warning, TEXT("Calling parent findplayerstart"));
 	return Super::FindPlayerStart_Implementation(Player, IncomingName);
 }
 
@@ -1169,6 +1148,28 @@ void AUTeamArenaGame::InitializeSpawnPointSystem()
 		return;
 	}
 	ScoreAllSpawnPoints();
+	// Only run this if we have enough spawns to safely remove some
+	if (AllSpawnPoints.Num() > 4)
+	{
+		// Sort by height, descending (tallest first)
+		AllSpawnPoints.Sort([](const FSpawnPointData& A, const FSpawnPointData& B)
+		{
+			return A.HeightScore > B.HeightScore;
+		});
+
+		UE_LOG(LogGameMode, Warning, TEXT("InitializeSpawnPointSystem: Removing top  spawn for fairness."));
+
+		// Log which spawns we're about to remove
+		if (AllSpawnPoints[0].PlayerStart)
+		{
+			UE_LOG(LogGameMode, Warning, TEXT("  - Removing: %s (HeightScore: %f)"), *AllSpawnPoints[0].PlayerStart->GetName(), AllSpawnPoints[0].HeightScore);
+		}
+
+		
+		// Remove the top  spawn from the list
+		AllSpawnPoints.RemoveAt(0);
+
+	}
 	UE_LOG(LogGameMode, Log, TEXT("InitializeSpawnPointSystem: Analyzed %d spawn points"), AllSpawnPoints.Num());
 }
 
@@ -1246,7 +1247,7 @@ void AUTeamArenaGame::SelectOptimalSpawnPairForTeam(int32 TeamIndex)
 	APlayerStart* SecondarySpawn = nullptr;
 
 	// NEW: Use multiple selection strategies and rotate between them
-	int32 SelectionStrategy = CurrentRoundNumber % 3; // Rotate between 3 strategies
+	int32 SelectionStrategy = CurrentRoundNumber % 2; // Rotate between 2 strategies
 
 	switch (SelectionStrategy)
 	{
@@ -1347,6 +1348,15 @@ void AUTeamArenaGame::FindMaxDistanceSpawnPair(const TArray<FSpawnPointData*>& C
 
 			float MinDist1 = CalculateMinDistanceToEnemySpawns(Spawn1, EnemySpawns);
 			float MinDist2 = CalculateMinDistanceToEnemySpawns(Spawn2, EnemySpawns);
+
+			// --- NEW: Enforce Minimum Distance ---
+			// If enemy spawns exist, check distance.
+			if (EnemySpawns.Num() > 0 && (MinDist1 < MinimumEnemySpawnDistance || MinDist2 < MinimumEnemySpawnDistance))
+			{
+				continue; // This pair is too close to the enemy. Skip it.
+			}
+			// --- END NEW ---
+
 			float HeightScore1 = CandidateSpawns[i]->HeightScore;
 			float HeightScore2 = CandidateSpawns[j]->HeightScore;
 			float UsageScore1 = 1.0f / (1.0f + CandidateSpawns[i]->GetUsageCountForTeam(0) + CandidateSpawns[i]->GetUsageCountForTeam(1));
@@ -1723,68 +1733,6 @@ AUTPlayerState* AUTeamArenaGame::FindAliveTeammate(AUTPlayerState* PS) const
 }
 
 
-/*
-AUTPlayerState* AUTeamArenaGame::FindAliveTeammate(AUTPlayerState* PS) const
-{
-	if (!PS || !PS->Team) return nullptr;
-	const int32 TeamIdx = PS->Team->TeamIndex;
-	for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
-	{
-		APlayerController* PC = It->Get();
-		AUTPlayerState* OtherPS = PC ? Cast<AUTPlayerState>(PC->PlayerState) : nullptr;
-		if (!OtherPS || OtherPS == PS || !OtherPS->Team || OtherPS->Team->TeamIndex != TeamIdx) continue;
-		APawn* P = PC->GetPawn();
-		AUTCharacter* C = Cast<AUTCharacter>(P);
-		if (P && (!C || !C->IsDead()))
-		{
-			return OtherPS;
-		}
-	}
-	return nullptr;
-}
-
-
-
-
-
-
-AUTPlayerState* AUTeamArenaGame::FindAliveEnemy(AUTPlayerState* PS) const
-{
-	if (!PS || !PS->Team) return nullptr;
-	const int32 MyTeam = PS->Team->TeamIndex;
-	for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
-	{
-		APlayerController* PC = It->Get();
-		AUTPlayerState* OtherPS = PC ? Cast<AUTPlayerState>(PC->PlayerState) : nullptr;
-		if (!OtherPS || !OtherPS->Team || OtherPS->Team->TeamIndex == MyTeam) continue;
-		APawn* P = PC->GetPawn();
-		AUTCharacter* C = Cast<AUTCharacter>(P);
-		if (P && (!C || !C->IsDead()))
-		{
-			return OtherPS;
-		}
-	}
-	return nullptr;
-}
-
-int32 AUTeamArenaGame::CountAliveOnTeam(int32 TeamIndex) const
-{
-	int32 Alive = 0;
-	for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
-	{
-		const APlayerController* PC = It->Get();
-		const AUTPlayerState* PS = PC ? Cast<AUTPlayerState>(PC->PlayerState) : nullptr;
-		if (!PS || !PS->Team || PS->Team->TeamIndex != TeamIndex || PS->bOnlySpectator) continue;
-		const APawn* P = PC->GetPawn();
-		const AUTCharacter* C = Cast<AUTCharacter>(P);
-		if (P && (!C || !C->IsDead()))
-		{
-			++Alive;
-		}
-	}
-	return Alive;
-}
-*/
 
 
 int32 AUTeamArenaGame::CountAliveOnTeam(int32 TeamIndex) const
@@ -1930,24 +1878,7 @@ bool AUTeamArenaGame::CanSpectate_Implementation(APlayerController* Viewer, APla
 	return Super::CanSpectate_Implementation(Viewer, ViewTarget);
 }
 
-/*
-AUTPlayerState* AUTeamArenaGame::FindAliveOnTeamPS(int32 TeamIndex) const
-{
-	for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
-	{
-		APlayerController* PC = It->Get();
-		AUTPlayerState* PS = PC ? Cast<AUTPlayerState>(PC->PlayerState) : nullptr;
-		if (!PS || !PS->Team || PS->Team->TeamIndex != TeamIndex || PS->bOnlySpectator) continue;
-		APawn* P = PC->GetPawn();
-		const AUTCharacter* C = Cast<AUTCharacter>(P);
-		if (P && (!C || !C->IsDead()))
-		{
-			return PS;
-		}
-	}
-	return nullptr;
-}
-*/
+
 
 
 AUTPlayerState* AUTeamArenaGame::FindAliveOnTeamPS(int32 TeamIndex) const
@@ -2060,6 +1991,16 @@ void AUTeamArenaGame::CheckLastManStanding(int32 Alive0, int32 Alive1)
 		AUTPlayerState* ClutchPlayer = FindAliveOnTeamPS(0);
 		BroadcastLastManStanding(0, ClutchPlayer);
 		bTeam0LastManAnnounced = true;
+		// NEW: Track dark horse potential - Team0 player is now 1 vs Alive1 enemies
+		if (ClutchPlayer && Alive1 >= 2)
+		{
+			// This player is now in a 1v2+ situation - mark them as a dark horse candidate
+			if (!DarkHorseCandidates.Contains(ClutchPlayer))
+			{
+				DarkHorseCandidates.Add(ClutchPlayer, Alive1); // Store how many enemies they're facing
+				UE_LOG(LogGameMode, Log, TEXT("Dark Horse Candidate: %s (Team 0) is now 1v%d"), *ClutchPlayer->PlayerName, Alive1);
+			}
+		}
 		if (ClutchPlayer)
 		{	// Broadcast the "clutch attempt" event
 			// Pass the player and the number of enemies they are facing (Alive1)
@@ -2072,6 +2013,16 @@ void AUTeamArenaGame::CheckLastManStanding(int32 Alive0, int32 Alive1)
 		AUTPlayerState* ClutchPlayer = FindAliveOnTeamPS(1);
 		BroadcastLastManStanding(1, ClutchPlayer);
 		bTeam1LastManAnnounced = true;
+		// NEW: Track dark horse potential - Team1 player is now 1 vs Alive0 enemies
+		if (ClutchPlayer && Alive0 >= 2)
+		{
+			// This player is now in a 1v2+ situation - mark them as a dark horse candidate
+			if (!DarkHorseCandidates.Contains(ClutchPlayer))
+			{
+				DarkHorseCandidates.Add(ClutchPlayer, Alive0); // Store how many enemies they're facing
+				UE_LOG(LogGameMode, Log, TEXT("Dark Horse Candidate: %s (Team 1) is now 1v%d"), *ClutchPlayer->PlayerName, Alive0);
+			}
+		}
 		if (ClutchPlayer)
 		{
 			// Broadcast the "clutch attempt" event
@@ -2087,32 +2038,6 @@ void AUTeamArenaGame::BroadcastLastManStanding(int32 LastManTeamIndex, AUTPlayer
 	// Call Blueprint implementation first (for players without C++ plugin)
 	BP_OnLastManStanding(LastManTeamIndex, LastManPlayerState);
 
-	/* Then do C++ implementation for players with the plugin
-	if (!LastManStandingSound && !EnemyLastManStandingSound)
-	{
-		return;
-	}
-	for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
-	{
-		AUTPlayerController* PC = Cast<AUTPlayerController>(It->Get());
-		if (!PC) continue;
-		AUTPlayerState* PS = Cast<AUTPlayerState>(PC->PlayerState);
-		if (!PS || !PS->Team) continue;
-		if (PS->Team->TeamIndex == LastManTeamIndex)
-		{
-			if (LastManStandingSound)
-			{
-				PC->UTClientPlaySound(LastManStandingSound);
-			}
-		}
-		else
-		{
-			if (EnemyLastManStandingSound)
-			{
-				PC->UTClientPlaySound(EnemyLastManStandingSound);
-			}
-		}
-	}*/
 }
 
 void AUTeamArenaGame::CheckRoundWinConditions()
@@ -2200,27 +2125,6 @@ void AUTeamArenaGame::BroadcastRoundResults(int32 WinnerTeamIndex, bool bIsDraw)
 	}
 	BP_OnRoundResults(WinnerTeamIndex, bIsDraw, bAllWinnersAlive);
 
-	/* Then do C++ implementation for players with the plugin
-	int32 MessageIndex;
-	if (bIsDraw)
-	{
-		MessageIndex = 2;
-	}
-	else if (WinnerTeamIndex == 0)
-	{
-		MessageIndex = 0;
-	}
-	else
-	{
-		MessageIndex = 1;
-	}
-	for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
-	{
-		if (AUTPlayerController* PC = Cast<AUTPlayerController>(It->Get()))
-		{
-			PC->ClientReceiveLocalizedMessage(UUTTeamArenaVictoryMessage::StaticClass(), MessageIndex, nullptr, nullptr, nullptr);
-		}
-	}*/
 }
 
 void AUTeamArenaGame::CheckRoundAchievements(int32 WinnerTeamIndex, FName Reason)
@@ -2234,52 +2138,7 @@ void AUTeamArenaGame::CheckRoundAchievements(int32 WinnerTeamIndex, FName Reason
 	CheckForHighDamageCarry(WinnerTeamIndex);
 }
 
-/*
-void AUTeamArenaGame::CheckForACE(int32 WinnerTeamIndex)
-{
-	int32 EnemyTeamIndex = (WinnerTeamIndex == 0) ? 1 : 0;
-	int32 EnemyTeamSize = 0;
-	for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
-	{
-		AUTPlayerState* PS = Cast<AUTPlayerState>((*It)->PlayerState);
-		if (PS && PS->Team && PS->Team->TeamIndex == EnemyTeamIndex && !PS->bOnlySpectator)
-		{
-			EnemyTeamSize++;
-		}
-	}
-	for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
-	{
-		AUTPlayerState* PS = Cast<AUTPlayerState>((*It)->PlayerState);
-		UE_LOG(LogGameMode, Log, TEXT("checking ACE for %s"), *PS->PlayerName);
-		if (PS && PS->Team && PS->Team->TeamIndex == WinnerTeamIndex && PS->RoundKills >= EnemyTeamSize && EnemyTeamSize >= 2)
-		{
-			RecordACE(PS);
-			break;
-		}
-	}
-}
 
-void AUTeamArenaGame::CheckForDarkHorse(int32 WinnerTeamIndex)
-{
-	int32 AliveWinners = CountAliveOnTeam(WinnerTeamIndex);
-	if (AliveWinners == 1)
-	{
-		for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
-		{
-			AUTPlayerState* PS = Cast<AUTPlayerState>((*It)->PlayerState);
-			if (PS && PS->Team && PS->Team->TeamIndex == WinnerTeamIndex)
-			{
-				AUTCharacter* Character = PS->GetUTCharacter();
-				if (Character && !Character->IsDead() && PS->RoundKills >= 2)
-				{
-					RecordDarkHorse(PS, PS->RoundKills);
-					break;
-				}
-			}
-		}
-	}
-}
-*/
 
 void AUTeamArenaGame::CheckForDarkHorse(int32 WinnerTeamIndex)
 {
@@ -2298,9 +2157,15 @@ void AUTeamArenaGame::CheckForDarkHorse(int32 WinnerTeamIndex)
 				if (!PS || PS->bOnlySpectator) continue;
 
 				AUTCharacter* Character = PS->GetUTCharacter();
-				if (Character && !Character->IsDead() && PS->RoundKills >= 2)
+				if (Character && !Character->IsDead() && PS->RoundKills >= 3)
 				{
-					RecordDarkHorse(PS, PS->RoundKills);
+					// NEW: Only award dark horse if this player was marked as a candidate
+					// (meaning they were in a 1v2+ situation at some point)
+					if (DarkHorseCandidates.Contains(PS))
+					{
+						int32 EnemiesTheyFaced = DarkHorseCandidates[PS];
+						RecordDarkHorse(PS, EnemiesTheyFaced);
+					}
 					break;
 				}
 			}
@@ -2456,24 +2321,6 @@ bool AUTeamArenaGame::ModifyDamage_Implementation(int32& Damage, FVector& Moment
 		}
 	}
 
-	/* Apply standard team damage reduction
-	if (InstigatedBy != NULL && Injured && InstigatedBy != Injured->Controller && Cast<AUTGameState>(GameState)->OnSameTeam(Injured, InstigatedBy))
-	{
-		Damage *= TeamDamagePct;
-		Momentum *= TeamMomentumPct;
-		AUTCharacter* InjuredChar = Cast<AUTCharacter>(Injured);
-		if (InjuredChar && InjuredChar->bApplyWallSlide)
-		{
-			Momentum *= WallRunMomentumPct;
-		}
-		AUTPlayerController* InstigatorPC = Cast<AUTPlayerController>(InstigatedBy);
-		if (InstigatorPC && Cast<AUTPlayerState>(Injured->PlayerState))
-		{
-			((AUTPlayerState*)(Injured->PlayerState))->AnnounceSameTeam(InstigatorPC);
-		}
-	}
-	*/
-	// Call parent *after* our logic
 	return Super::ModifyDamage_Implementation(Damage, Momentum, Injured, InstigatedBy, HitInfo, DamageCauser, DamageType);
 }
 

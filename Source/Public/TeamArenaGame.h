@@ -567,7 +567,7 @@ protected:
 	void CheckForACE(int32 WinnerTeamIndex);
 	void CheckForDarkHorse(int32 WinnerTeamIndex);
 	void CheckForHighDamageCarry(int32 WinnerTeamIndex);
-
+	TMap<TWeakObjectPtr<AUTPlayerState>, int32> DarkHorseCandidates;
 	// New spawn selection methods
 	void FindLeastUsedSpawnPair(const TArray<FSpawnPointData*>& CandidateSpawns, int32 TeamIndex, APlayerStart*& OutPrimary, APlayerStart*& OutSecondary);
 	void FindBalancedRandomSpawnPair(const TArray<FSpawnPointData*>& CandidateSpawns, const TArray<APlayerStart*>& EnemySpawns, int32 TeamIndex, APlayerStart*& OutPrimary, APlayerStart*& OutSecondary);
