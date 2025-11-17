@@ -137,7 +137,13 @@ public:
 	void BP_OnSetIntermission(bool bInIntermission, int32 IntermissionRemain);
 
 	UFUNCTION(BlueprintImplementableEvent, Category = "Arena|Bridge")
-	void BP_OnSetRound(bool bInProgress, int32 RoundRemain, int32 LastWinnerTeamIndex);
+	void BP_OnSetRound(bool bInProgress, int32 RoundRemain, int32 LastWinnerTeamIndex, const TArray<AUTPlayerState*>& Team0AlivePlayers, const TArray<AUTPlayerState*>& Team1AlivePlayers);
+
+	UPROPERTY(Transient, BlueprintReadOnly, Category = "Arena|Bridge")
+	TArray<AUTPlayerState*> Team0AlivePlayers;
+
+	UPROPERTY(Transient, BlueprintReadOnly, Category = "Arena|Bridge")
+	TArray<AUTPlayerState*> Team1AlivePlayers;
 
 	UFUNCTION(BlueprintImplementableEvent, Category = "Arena|Bridge")
 	void BP_OnLastManStanding(int32 LastManTeamIndex, AUTPlayerState* LastManPlayerState);

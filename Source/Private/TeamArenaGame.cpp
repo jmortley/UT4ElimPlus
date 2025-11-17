@@ -322,7 +322,7 @@ void AUTeamArenaGame::DefaultTimer()
 						//LastWinnerTeamIndex INDEX_NONE  // or cached Winner if you track it
 					);
 			*/
-			BP_OnSetRound(true, RoundRemain, LastRoundWinningTeamIndex);
+			BP_OnSetRound(true, RoundRemain, LastRoundWinningTeamIndex, Team0AlivePlayers, Team1AlivePlayers);
 			
 
 			if (RoundRemain == 0)
@@ -618,6 +618,11 @@ void AUTeamArenaGame::StartNextRound()
 	ResetPlayersForNewRound();
 	ResetSpawnSelectionForNewRound();
 	DarkHorseCandidates.Empty();
+
+	// Clear alive player arrays
+	Team0AlivePlayers.Empty();
+	Team1AlivePlayers.Empty();
+
 	// 2. Spawn players for the *new* round
 	bAllowPlayerRespawns = true; // Allow RestartPlayer to work
 	int32 PlayersSpawned = 0;
@@ -645,11 +650,20 @@ void AUTeamArenaGame::StartNextRound()
 			RestartPlayer(C);
 			PlayersSpawned++;
 
+
 			// Track team sizes for Last Man Standing
 			if (PS->Team)
 			{
-				if (PS->Team->TeamIndex == 0) Team0StartingSize++;
-				else if (PS->Team->TeamIndex == 1) Team1StartingSize++;
+				if (PS->Team->TeamIndex == 0)
+				{
+					Team0StartingSize++;
+					Team0AlivePlayers.Add(PS); // Add to Team 0 alive players
+				}
+				else if (PS->Team->TeamIndex == 1)
+				{
+					Team1StartingSize++;
+					Team1AlivePlayers.Add(PS); // Add to Team 1 alive players
+				}
 			}
 		}
 	}
@@ -674,7 +688,7 @@ void AUTeamArenaGame::StartNextRound()
 	if (AUTGameState* GS = GetWorld()->GetGameState<AUTGameState>())
 	{
 		
-		BP_OnSetRound(true, RoundTimeSeconds, LastRoundWinningTeamIndex);
+		BP_OnSetRound(true, RoundTimeSeconds, LastRoundWinningTeamIndex, Team0AlivePlayers, Team1AlivePlayers);
 		BP_OnSetIntermission(false, 0);
 		// Still fine to force a net update on the base GameState
 		GS->ForceNetUpdate();
@@ -751,7 +765,7 @@ void AUTeamArenaGame::EndRoundForTeam(int32 WinnerTeamIndex, FName Reason)
 	// Update GameState with winner for this intermission
 	if (AUTGameState* GS = GetGameState<AUTGameState>())
 	{
-		BP_OnSetRound(false, 0, LastRoundWinningTeamIndex);
+		BP_OnSetRound(false, 0, LastRoundWinningTeamIndex, Team0AlivePlayers, Team1AlivePlayers);
 		// Replication push — still valid on the base class
 		GS->ForceNetUpdate();
 	}
@@ -1247,7 +1261,7 @@ void AUTeamArenaGame::SelectOptimalSpawnPairForTeam(int32 TeamIndex)
 	APlayerStart* SecondarySpawn = nullptr;
 
 	// NEW: Use multiple selection strategies and rotate between them
-	int32 SelectionStrategy = CurrentRoundNumber % 2; // Rotate between 2 strategies
+	int32 SelectionStrategy = CurrentRoundNumber % 3; // Rotate between 2 strategies
 
 	switch (SelectionStrategy)
 	{
@@ -1259,7 +1273,10 @@ void AUTeamArenaGame::SelectOptimalSpawnPairForTeam(int32 TeamIndex)
 		FindBalancedRandomSpawnPair(Candidates, EnemySpawns, TeamIndex, PrimarySpawn, SecondarySpawn);
 		break;
 
-		// Strategy 1 (FindLeastUsedSpawnPair) is now skipped
+	case 2: // Distance-focused selection
+		FindMaxDistanceSpawnPair(Candidates, EnemySpawns, PrimarySpawn, SecondarySpawn);
+		break;
+		
 	}
 
 	//FindMaxDistanceSpawnPair(Candidates, EnemySpawns, PrimarySpawn, SecondarySpawn);
@@ -1564,10 +1581,24 @@ FVector AUTeamArenaGame::FindSafeSpawnOffset(APlayerStart* BaseSpawn, int32 Atte
 TArray<FSpawnPointData*> AUTeamArenaGame::GetSpawnCandidatesForTeam(int32 TeamIndex)
 {
 	TArray<FSpawnPointData*> Candidates;
+	bool bSwapSides = (CurrentRoundNumber % 2 == 1);
+
 	for (FSpawnPointData& SpawnData : AllSpawnPoints)
 	{
 		if (!SpawnData.PlayerStart) continue;
-		bool bIsTeamSide = (TeamIndex == 0 && SpawnData.TeamSideScore <= 0.0f) || (TeamIndex == 1 && SpawnData.TeamSideScore >= 0.0f);
+
+		bool bIsTeamSide;
+		if (bSwapSides)
+		{
+			// ODD round: Team 0 is Positive, Team 1 is Negative
+			bIsTeamSide = (TeamIndex == 0 && SpawnData.TeamSideScore >= 0.0f) || (TeamIndex == 1 && SpawnData.TeamSideScore <= 0.0f);
+		}
+		else
+		{
+			// EVEN round: Team 0 is Negative, Team 1 is Positive
+			bIsTeamSide = (TeamIndex == 0 && SpawnData.TeamSideScore <= 0.0f) || (TeamIndex == 1 && SpawnData.TeamSideScore >= 0.0f);
+		}
+
 		if (bIsTeamSide || FMath::Abs(SpawnData.TeamSideScore) < 0.2f)
 		{
 			Candidates.Add(&SpawnData);
@@ -1640,6 +1671,7 @@ void AUTeamArenaGame::ResetSpawnSelectionForNewRound()
 	Team1SelectedSpawns.Empty();
 	++CurrentRoundNumber;
 	//UE_LOG(LogGameMode, Log, TEXT("ResetSpawnSelectionForNewRound: Starting round %d"), CurrentRoundNumber);
+	FMath::SRandInit(static_cast<int32>(FPlatformTime::Cycles()));
 }
 
 void AUTeamArenaGame::ForceTeamSpectate(AUTPlayerState* DeadPS)
@@ -2316,7 +2348,6 @@ bool AUTeamArenaGame::ModifyDamage_Implementation(int32& Damage, FVector& Moment
 		if (InjuredPS && InjuredPS->Team && InjuredPS->Team->TeamIndex == LastRoundWinningTeamIndex)
 		{
 			Damage = 0;
-			Momentum = FVector::ZeroVector;
 			return true; // Damage modified (to zero)
 		}
 	}
