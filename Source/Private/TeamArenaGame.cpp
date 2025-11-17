@@ -202,7 +202,7 @@ void AUTeamArenaGame::HandleMatchHasStarted()
 
 void AUTeamArenaGame::CallMatchStateChangeNotify()
 {
-	UE_LOG(LogGameMode, Log, TEXT("Current matchstate: %s"), *GetMatchState().ToString());
+	//UE_LOG(LogGameMode, Log, TEXT("Current matchstate: %s"), *GetMatchState().ToString());
 	// This function intercepts all SetMatchState calls
 	// and routes them to our custom handlers.
 	if (GetMatchState() == MatchState::WaitingToStart)
@@ -298,7 +298,7 @@ void AUTeamArenaGame::DefaultTimer()
 			BP_OnSetIntermission(/*bInIntermission*/false, IntermissionSecondsRemaining);
 			CleanupWorldForNewRound();
 			SetMatchState(MatchState::InProgress);
-			UE_LOG(LogGameMode, Log, TEXT("DefaultTimer: Intermission complete. Cleaning world and setting state to InProgress."));
+			//UE_LOG(LogGameMode, Log, TEXT("DefaultTimer: Intermission complete. Cleaning world and setting state to InProgress."));
 
 
 		}
@@ -866,12 +866,17 @@ void AUTeamArenaGame::RestartPlayer(AController* NewPlayer)
 	{
 		if (MustSpectate(PC))
 		{
-			UE_LOG(LogGameMode, Verbose, TEXT("RestartPlayer: Skipping spectator-only player %s"),
-				PC->PlayerState ? *PC->PlayerState->PlayerName : TEXT("Unknown"));
+			//UE_LOG(LogGameMode, Verbose, TEXT("RestartPlayer: Skipping spectator-only player %s"),
+			//PC->PlayerState ? *PC->PlayerState->PlayerName : TEXT("Unknown");
 			return;
 		}
 	}
-
+	if (GetMatchState() == MatchState::WaitingToStart)
+	{
+		// Use Epic's spawn logic by calling the base class implementation
+		Super::RestartPlayer(NewPlayer);
+		return;
+	}
 	// Skip if they already have a pawn (protect mid-equip)
 	if (NewPlayer->GetPawn())
 	{
@@ -906,8 +911,8 @@ void AUTeamArenaGame::RestartPlayer(AController* NewPlayer)
 	{
 		// FIX: Call your ChoosePlayerStart and actually use the result
 		AActor* ChosenStart = ChoosePlayerStart_Implementation(NewPlayer);
-		UE_LOG(LogGameMode, Warning, TEXT("RestartPlayer: Chosen PlayerStart: %s"),
-			ChosenStart ? *ChosenStart->GetName() : TEXT("NULL"));
+		//UE_LOG(LogGameMode, Warning, TEXT("RestartPlayer: Chosen PlayerStart: %s"),
+		//	ChosenStart ? *ChosenStart->GetName() : TEXT("NULL"));
 
 		OverriddenPlayerStart = ChosenStart;
 		//bSetPlayerDefaultsNewSpawn = true;
@@ -1089,13 +1094,18 @@ AActor* AUTeamArenaGame::ChoosePlayerStart_Implementation(AController* Player)
 			}
 		}
 
-		if (CountAtSpawnA <= CountAtSpawnB)
+		if (CountAtSpawnA < CountAtSpawnB)
 		{
 			ChosenSpawn = SpawnA;
 		}
-		else
+		else if (CountAtSpawnB < CountAtSpawnA)
 		{
 			ChosenSpawn = SpawnB;
+		}
+		else
+		{
+			// Counts are equal, so randomly pick one instead of forcing constant spawn pairs
+			ChosenSpawn = FMath::RandBool() ? SpawnA : SpawnB;
 		}
 	}
 	else if (SelectedSpawns.Num() > 0)
@@ -1135,7 +1145,7 @@ AActor* AUTeamArenaGame::FindPlayerStart_Implementation(AController* Player, con
 	// If we have an overridden player start (from RestartPlayer), use it
 	if (OverriddenPlayerStart)
 	{
-		UE_LOG(LogGameMode, Warning, TEXT("Using overriden playerstart"));
+		//UE_LOG(LogGameMode, Warning, TEXT("Using overriden playerstart"));
 		return OverriddenPlayerStart;
 	}
 
@@ -1684,20 +1694,20 @@ void AUTeamArenaGame::ForceTeamSpectate(AUTPlayerState* DeadPS)
 	}
 	AUTPlayerController* PC = Cast<AUTPlayerController>(DeadPS->GetOwner());
 	if (!PC) return;
-	PC->ChangeState(NAME_Spectating);
-	PC->ClientGotoState(NAME_Spectating);
+	//PC->ChangeState(NAME_Spectating);
+	//PC->ClientGotoState(NAME_Spectating);
 	if (AUTPlayerState* TeamTarget = FindAliveTeammate(DeadPS))
 	{
-		//PC->SetViewTarget(TeamTarget->GetUTCharacter());
-		PC->ServerViewPlayerState(TeamTarget);
+		PC->SetViewTarget(TeamTarget->GetUTCharacter());
+		//PC->ServerViewPlayerState(TeamTarget);
 		PC->bSpectateBehindView = false;  // Force first person view
 		PC->BehindView(false);
 		return;
 	}
 	if (AUTPlayerState* EnemyTarget = FindAliveEnemy(DeadPS))
 	{
-		//PC->SetViewTarget(EnemyTarget->GetUTCharacter());
-		PC->ServerViewPlayerState(EnemyTarget);
+		PC->SetViewTarget(EnemyTarget->GetUTCharacter());
+		//PC->ServerViewPlayerState(EnemyTarget);
 		PC->bSpectateBehindView = false;  // Force first person view
 		PC->BehindView(false);
 		return;
@@ -1804,7 +1814,7 @@ void AUTeamArenaGame::ForceLosersToViewWinners(int32 WinnerTeamIndex)
 		return;
 	}
 	const int32 LoserTeamIndex = (WinnerTeamIndex == 0) ? 1 : 0;
-	UE_LOG(LogGameMode, Warning, TEXT("ForceLosersToViewWinners: LoserTeamIndex is: %d"), LoserTeamIndex);
+	//UE_LOG(LogGameMode, Warning, TEXT("ForceLosersToViewWinners: LoserTeamIndex is: %d"), LoserTeamIndex);
 	AUTPlayerState* TargetPS = FindAliveOnTeamPS(WinnerTeamIndex);
 	if (!TargetPS)
 	{
@@ -1812,7 +1822,7 @@ void AUTeamArenaGame::ForceLosersToViewWinners(int32 WinnerTeamIndex)
 		TargetPS = FindAnyOnTeamPS(WinnerTeamIndex);
 		if (!TargetPS)
 		{
-			UE_LOG(LogGameMode, Error, TEXT("ForceLosersToViewWinners: FAILED. No winner PlayerState found to spectate."));
+			//UE_LOG(LogGameMode, Error, TEXT("ForceLosersToViewWinners: FAILED. No winner PlayerState found to spectate."));
 			return;
 		}
 	}
@@ -2030,7 +2040,7 @@ void AUTeamArenaGame::CheckLastManStanding(int32 Alive0, int32 Alive1)
 			if (!DarkHorseCandidates.Contains(ClutchPlayer))
 			{
 				DarkHorseCandidates.Add(ClutchPlayer, Alive1); // Store how many enemies they're facing
-				UE_LOG(LogGameMode, Log, TEXT("Dark Horse Candidate: %s (Team 0) is now 1v%d"), *ClutchPlayer->PlayerName, Alive1);
+				//UE_LOG(LogGameMode, Log, TEXT("Dark Horse Candidate: %s (Team 0) is now 1v%d"), *ClutchPlayer->PlayerName, Alive1);
 			}
 		}
 		if (ClutchPlayer)
@@ -2052,7 +2062,7 @@ void AUTeamArenaGame::CheckLastManStanding(int32 Alive0, int32 Alive1)
 			if (!DarkHorseCandidates.Contains(ClutchPlayer))
 			{
 				DarkHorseCandidates.Add(ClutchPlayer, Alive0); // Store how many enemies they're facing
-				UE_LOG(LogGameMode, Log, TEXT("Dark Horse Candidate: %s (Team 1) is now 1v%d"), *ClutchPlayer->PlayerName, Alive0);
+				//UE_LOG(LogGameMode, Log, TEXT("Dark Horse Candidate: %s (Team 1) is now 1v%d"), *ClutchPlayer->PlayerName, Alive0);
 			}
 		}
 		if (ClutchPlayer)
@@ -2268,14 +2278,14 @@ void AUTeamArenaGame::CheckForHighDamageCarry(int32 WinnerTeamIndex)
 void AUTeamArenaGame::RecordACE(AUTPlayerState* PlayerState)
 {
 	if (!PlayerState) return;
-	UE_LOG(LogGameMode, Log, TEXT("ACE Achievement: %s"), *PlayerState->PlayerName);
+	//UE_LOG(LogGameMode, Log, TEXT("ACE Achievement: %s"), *PlayerState->PlayerName);
 	OnPlayerACE.Broadcast(PlayerState);
 }
 
 void AUTeamArenaGame::RecordDarkHorse(AUTPlayerState* PlayerState, int32 EnemiesKilled)
 {
 	if (!PlayerState) return;
-	UE_LOG(LogGameMode, Log, TEXT("Dark Horse Achievement: %s (1v%d)"), *PlayerState->PlayerName, EnemiesKilled);
+	//UE_LOG(LogGameMode, Log, TEXT("Dark Horse Achievement: %s (1v%d)"), *PlayerState->PlayerName, EnemiesKilled);
 	OnPlayerDarkHorse.Broadcast(PlayerState, EnemiesKilled);
 }
 
@@ -2669,6 +2679,9 @@ void AUTeamArenaGame::Logout(AController* Exiting)
 			// We MUST remove it from our TMap to prevent
 			// stale pointer access.
 			PlayerRoundDamage.Remove(PS);
+			Team0AlivePlayers.Remove(PS);
+			Team1AlivePlayers.Remove(PS);
+			DarkHorseCandidates.Remove(PS);
 
 		}
 	}
