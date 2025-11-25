@@ -58,6 +58,10 @@ AUTeamArenaGame::AUTeamArenaGame(const FObjectInitializer& ObjectInitializer)
 	LastRoundWinningTeamIndex = INDEX_NONE;
 	AwardDisplayTime = 5.f; // Use this for the post-round delay
 	PreRoundCountdown = 3.f; // Use this for the pre-spawn countdown
+	RoundWinningKiller = nullptr;
+	WinningKillerPawn = nullptr;
+	RoundWinningKillTime = 0.0f;
+	bPendingDarkHorseReplay = false;
 	//SpawnProtectionTime = 3.f;
 	bWarmupMode = false;
 	SpectateDelay = 2.f;
@@ -106,6 +110,11 @@ AUTeamArenaGame::AUTeamArenaGame(const FObjectInitializer& ObjectInitializer)
 	//GameStateClass = AUTGameState::StaticClass();
 }
 
+
+bool AUTeamArenaGame::SupportsInstantReplay() const
+{
+	return true;
+}
 
 void AUTeamArenaGame::BP_SetMatchState_RoundCooldown()
 {
@@ -177,6 +186,13 @@ void AUTeamArenaGame::BeginPlay()
 
 	// We no longer start intermission here. 
 	// HandleMatchHasStarted will be called by the engine, which will call StartIntermission.
+}
+
+
+void AUTeamArenaGame::DelayedEndGame(int32 WinnerTeamIndex, FName Reason)
+{
+	AUTPlayerState* BestPlayer = FindBestPlayerOnTeam(WinnerTeamIndex);
+	EndGame(BestPlayer, Reason);
 }
 
 
@@ -386,6 +402,15 @@ void AUTeamArenaGame::HandleServerManagement()
 
 	// 4. REMOVED: Force respawn logic - not needed for round-based gameplay
 	// Your spawn control in RestartPlayer() already prevents unwanted spawning
+		// Update the Replay id.
+	if (UTIsHandlingReplays())
+	{
+		UDemoNetDriver* DemoNetDriver = GetWorld()->DemoNetDriver;
+		if (DemoNetDriver != nullptr && DemoNetDriver->ReplayStreamer.IsValid())
+		{
+			UTGameState->ReplayID = DemoNetDriver->ReplayStreamer->GetReplayID();
+		}
+	}
 }
 
 // NEW: Handle map voting logic (from Epic's UTGameMode::DefaultTimer)
@@ -607,6 +632,9 @@ void AUTeamArenaGame::StartNextRound()
 	}
 
 	// Reset per-round trackers
+	RoundWinningKiller = nullptr;
+	RoundWinningKillTime = 0.0f;
+	bPendingDarkHorseReplay = false;
 	LastRoundWinningTeamIndex = INDEX_NONE;
 	bTeam0LastManAnnounced = false;
 	bTeam1LastManAnnounced = false;
@@ -622,7 +650,8 @@ void AUTeamArenaGame::StartNextRound()
 	// Clear alive player arrays
 	Team0AlivePlayers.Empty();
 	Team1AlivePlayers.Empty();
-
+	SelectOptimalSpawnPairForTeam(0);
+	SelectOptimalSpawnPairForTeam(1);
 	// 2. Spawn players for the *new* round
 	bAllowPlayerRespawns = true; // Allow RestartPlayer to work
 	int32 PlayersSpawned = 0;
@@ -754,10 +783,30 @@ void AUTeamArenaGame::EndRoundForTeam(int32 WinnerTeamIndex, FName Reason)
 	if (!bIsDraw && Teams[WinnerTeamIndex]->Score >= GoalScore)
 	{
 		// Game Over
+		bool bReplayTriggered = false;
+		bool bIsMatchPoint = Teams[WinnerTeamIndex]->Score >= GoalScore;
+		if (bIsMatchPoint)
+		{
+			BroadcastKillReplay();
+			bReplayTriggered = true;
+		}
 		UE_LOG(LogGameMode, Warning, TEXT("Team %d has reached the score limit. Ending game."), WinnerTeamIndex);
-		AUTPlayerState* BestPlayer = FindBestPlayerOnTeam(WinnerTeamIndex);
-		EndGame(BestPlayer, FName(TEXT("ScoreLimit")));
+		if (bReplayTriggered)
+		{
+			// DELAY EndGame so the replay can actually play.
+			// 7.0 seconds gives time for the 0.5s delay + ~6s of replay footage
+			FTimerHandle UnusedHandle;
+			FTimerDelegate TimerDel;
+			TimerDel.BindUFunction(this, FName("DelayedEndGame"), WinnerTeamIndex, FName(TEXT("ScoreLimit")));
+			GetWorldTimerManager().SetTimer(UnusedHandle, TimerDel, 7.0f, false);
+
+			return; // EXIT NOW, do not call EndGame immediately
+		}
+		//AUTPlayerState* BestPlayer = FindBestPlayerOnTeam(WinnerTeamIndex);
+		//EndGame(BestPlayer, FName(TEXT("ScoreLimit")));
+		
 		return; // Do not proceed to intermission
+		
 	}
 
 	// --- Game is NOT over, proceed to intermission ---
@@ -783,6 +832,30 @@ void AUTeamArenaGame::EndRoundForTeam(int32 WinnerTeamIndex, FName Reason)
 	// Start the intermission timer
 	StartIntermission(AwardDisplayTime);
 }
+
+
+void AUTeamArenaGame::BroadcastKillReplay()
+{
+	if (WinningKillerPawn && RoundWinningKillTime > 0.f)
+	{
+		// Calculate offset (Current Time - Kill Time). 
+		// We add +2.0f to start the replay 2 seconds before the kill happens.
+		float ReplayOffset = (GetWorld()->GetTimeSeconds() - RoundWinningKillTime) + 5.0f;
+
+		for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
+		{
+			AUTPlayerController* PC = Cast<AUTPlayerController>(It->Get());
+			if (PC)
+			{
+				// Use ClientPlayInstantReplay instead of ClientQueueCoolMoment.
+				// This uses the Actor's NetworkGUID which works in PIE/Standalone.
+				// Param 3 (StartDelay) is 0.0f because we want it now.
+				PC->ClientPlayInstantReplay(WinningKillerPawn, ReplayOffset, 0.0f);
+			}
+		}
+	}
+}
+
 
 // This function is unchanged, but its role is now clear:
 // It's called by the timer set in CheckRoundWinConditions.
@@ -973,6 +1046,26 @@ void AUTeamArenaGame::ScoreKill_Implementation(AController* Killer, AController*
 	if (Team0Eliminated || Team1Eliminated)
 	{
 		UE_LOG(LogGameMode, Warning, TEXT("ScoreKill: This kill ends the round (Team0=%d, Team1=%d). Deferring spectate to EndRoundForTeam."), Alive0, Alive1);
+		if (Killer && Killer->PlayerState)
+		{
+			RoundWinningKiller = Cast<AUTPlayerState>(Killer->PlayerState);
+			RoundWinningKillTime = GetWorld()->GetTimeSeconds();
+			if (Killer && Killer->GetPawn())
+			{
+				WinningKillerPawn = Killer->GetPawn();
+			}
+			// Fallback to victim if killer is gone/invalid
+			else if (KilledPawn)
+			{
+				WinningKillerPawn = KilledPawn;
+			}
+			// CHECK FOR DARK HORSE REPLAY CONDITION
+			// If the killer was a tracked Dark Horse candidate, flag this for replay
+			if (RoundWinningKiller && DarkHorseCandidates.Contains(RoundWinningKiller))
+			{
+				bPendingDarkHorseReplay = true;
+			}
+		}
 	}
 	else
 	{
@@ -1051,11 +1144,13 @@ AActor* AUTeamArenaGame::ChoosePlayerStart_Implementation(AController* Player)
 	const int32 TeamIndex = PS->Team->TeamIndex;
 	TArray<APlayerStart*>& SelectedSpawns = (TeamIndex == 0) ? Team0SelectedSpawns : Team1SelectedSpawns;
 
+	/*
+	* calling this now in StartNextRound
 	if (SelectedSpawns.Num() == 0)
 	{
 		SelectOptimalSpawnPairForTeam(TeamIndex);
 	}
-
+	*/
 	if (SelectedSpawns.Num() == 0)
 	{
 		UE_LOG(LogGameMode, Warning, TEXT("ChoosePlayerStart: No spawns selected for team %d, using fallback"), TeamIndex);
@@ -1687,6 +1782,14 @@ void AUTeamArenaGame::ResetSpawnSelectionForNewRound()
 void AUTeamArenaGame::ForceTeamSpectate(AUTPlayerState* DeadPS)
 {
 	if (DeadPS == nullptr) return;
+
+	if (useBPSpecFunction)
+	{
+		// Call the Blueprint-implemented function if the flag is set
+		BP_SpectatePSImplementation(DeadPS);
+		return;
+	}
+
 	if (!DeadPS->bOutOfLives)
 	{
 		DeadPS->bOutOfLives = true;
@@ -1694,8 +1797,8 @@ void AUTeamArenaGame::ForceTeamSpectate(AUTPlayerState* DeadPS)
 	}
 	AUTPlayerController* PC = Cast<AUTPlayerController>(DeadPS->GetOwner());
 	if (!PC) return;
-	//PC->ChangeState(NAME_Spectating);
-	//PC->ClientGotoState(NAME_Spectating);
+	PC->ChangeState(NAME_Spectating);
+	PC->ClientGotoState(NAME_Spectating);
 	if (AUTPlayerState* TeamTarget = FindAliveTeammate(DeadPS))
 	{
 		PC->SetViewTarget(TeamTarget->GetUTCharacter());
@@ -1856,7 +1959,8 @@ void AUTeamArenaGame::ForceLosersToViewWinners(int32 WinnerTeamIndex)
 			}
 			PC->SetViewTarget(TargetCharacter);
 			PC->bSpectateBehindView = false;  // Force first person view
-			PC->BehindView(false);           // Apply the camera mode
+			PC->BehindView(false);
+			//PC->SetFocusToGameViewport();// Apply the camera mode
 			//UE_LOG(LogGameMode, Warning, TEXT("ForceLosersToViewWinners: Set %s to directly view character %s"),
 			//	*PS->PlayerName, *TargetCharacter->GetName());
 		}
@@ -2659,7 +2763,8 @@ void AUTeamArenaGame::BP_RestartCurrentRound()
 
 	// Reset spawn selection for the new round attempt
 	ResetSpawnSelectionForNewRound();
-
+	SelectOptimalSpawnPairForTeam(0);
+	SelectOptimalSpawnPairForTeam(1);
 	// Start a brief intermission before the new round (3 seconds)
 	StartIntermission(3);
 

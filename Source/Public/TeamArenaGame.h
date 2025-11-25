@@ -132,6 +132,13 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "TeamArena|Round Control")
 	void BP_RestartCurrentRound();
 
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spectating")
+	bool useBPSpecFunction;
+
+	// Blueprint-implementable function for spectating
+	UFUNCTION(BlueprintImplementableEvent, Category = "Spectating")
+	void BP_SpectatePSImplementation(AUTPlayerState* PlayerState);
+
 	// C++ calls these; BP implements them (no headers, no reflection in C++).
 	UFUNCTION(BlueprintImplementableEvent, Category = "Arena|Bridge")
 	void BP_OnSetIntermission(bool bInIntermission, int32 IntermissionRemain);
@@ -196,7 +203,7 @@ public:
 	void BP_SetMatchState_InProgress();
 
 	// -------- Replay opt-in (FlagRun does this) --------
-	//virtual bool SupportsInstantReplay() const override;
+	virtual bool SupportsInstantReplay() const override;
 
 	UFUNCTION(BlueprintNativeEvent)
 	bool CanSpectate(APlayerController* Viewer, APlayerState* ViewTarget);
@@ -328,7 +335,20 @@ public:
 
 protected:
 	// -------- Round flow --------
+	UPROPERTY()
+	AUTPlayerState* RoundWinningKiller;
 
+	UFUNCTION()
+	void DelayedEndGame(int32 WinnerTeamIndex, FName Reason);
+
+	UPROPERTY()
+	APawn* WinningKillerPawn = nullptr;
+
+	float RoundWinningKillTime;
+
+	void BroadcastKillReplay();
+
+	bool bPendingDarkHorseReplay;
 	/** * REWRITTEN: Now just sets the state to MatchIntermission and sets the timer.
 	 */
 	void StartIntermission(int32 Seconds);
