@@ -66,7 +66,7 @@ AUTeamArenaGame::AUTeamArenaGame(const FObjectInitializer& ObjectInitializer)
 	bWarmupMode = false;
 	SpectateDelay = 2.f;
 	TotalRoundsPlayed = 0;
-	HighDamageCarryThreshold = 70.0f;
+	HighDamageCarryThreshold = 60.0f;
 	//bCasterControl = true;
 	// Initialize last man standing tracking
 	Team0StartingSize = 0;
@@ -99,11 +99,11 @@ AUTeamArenaGame::AUTeamArenaGame(const FObjectInitializer& ObjectInitializer)
 	CurrentWaveDamage = 0.0f;
 
 	//Spawn weighting system with default values
-	SpawnDistanceWeight = 0.45f;
+	SpawnDistanceWeight = 0.65f;
 	SpawnHeightWeight = 0.10f;
-	SpawnUsageWeight = 0.30f;
+	SpawnUsageWeight = 0.10f;
 	SpawnSeparationWeight = 0.15f;
-	//MinimumEnemySpawnDistance = 2000.0f; // Minimum distance from enemy spawns
+	MinimumEnemySpawnDistance = 2700.0f; // Minimum distance from enemy spawns
 	//PreferredEnemySpawnDistance = 3500.0f; // Preferred distance from enemy spawns
 
 	// OvertimeDamageType = UDamageType::StaticClass(); // Already set above
@@ -182,6 +182,8 @@ void AUTeamArenaGame::BeginPlay()
 	//GetWorldTimerManager().SetTimerForNextTick([this]()
 	GetWorldTimerManager().SetTimerForNextTick(this, &AUTeamArenaGame::DeferredHandleMatchStart);
 	UE_LOG(LogTemp, Error, TEXT("GameMode::BeginPlay called"));
+
+
 	//GetWorldTimerManager().SetTimerForNextTick(this, &AUTeamArenaGame::DeferredCheckRoundWinConditions);
 
 	// We no longer start intermission here. 
@@ -198,17 +200,6 @@ void AUTeamArenaGame::DelayedEndGame(int32 WinnerTeamIndex, FName Reason)
 
 void AUTeamArenaGame::HandleMatchHasStarted()
 {
-	//Super::HandleMatchHasStarted();
-
-	AUTGameState* GS = GetGameState<AUTGameState>();
-	if (GS == nullptr)
-	{
-		UE_LOG(LogGameMode, Error, TEXT("HandleMatchHasStarted: AURArenaGameState is NULL. This is normal in PIE if World Settings are not set. Deferring."));
-
-		// Try again next tick.
-		GetWorldTimerManager().SetTimerForNextTick(this, &AUTeamArenaGame::HandleMatchHasStarted);
-		return;
-	}
 
 	Super::HandleMatchHasStarted();
 	bWarmupMode = false;
@@ -798,7 +789,7 @@ void AUTeamArenaGame::EndRoundForTeam(int32 WinnerTeamIndex, FName Reason)
 			FTimerHandle UnusedHandle;
 			FTimerDelegate TimerDel;
 			TimerDel.BindUFunction(this, FName("DelayedEndGame"), WinnerTeamIndex, FName(TEXT("ScoreLimit")));
-			GetWorldTimerManager().SetTimer(UnusedHandle, TimerDel, 7.0f, false);
+			GetWorldTimerManager().SetTimer(UnusedHandle, TimerDel, 3.0f, false);
 
 			return; // EXIT NOW, do not call EndGame immediately
 		}
@@ -836,7 +827,7 @@ void AUTeamArenaGame::EndRoundForTeam(int32 WinnerTeamIndex, FName Reason)
 
 void AUTeamArenaGame::BroadcastKillReplay()
 {
-	if (WinningKillerPawn && RoundWinningKillTime > 0.f)
+	if (RoundWinningKiller && RoundWinningKillTime > 0.f)
 	{
 		// Calculate offset (Current Time - Kill Time). 
 		// We add +2.0f to start the replay 2 seconds before the kill happens.
@@ -850,7 +841,7 @@ void AUTeamArenaGame::BroadcastKillReplay()
 				// Use ClientPlayInstantReplay instead of ClientQueueCoolMoment.
 				// This uses the Actor's NetworkGUID which works in PIE/Standalone.
 				// Param 3 (StartDelay) is 0.0f because we want it now.
-				PC->ClientPlayInstantReplay(WinningKillerPawn, ReplayOffset, 0.0f);
+				PC->ClientQueueCoolMoment(RoundWinningKiller->UniqueId, ReplayOffset);
 			}
 		}
 	}
@@ -1048,16 +1039,17 @@ void AUTeamArenaGame::ScoreKill_Implementation(AController* Killer, AController*
 		UE_LOG(LogGameMode, Warning, TEXT("ScoreKill: This kill ends the round (Team0=%d, Team1=%d). Deferring spectate to EndRoundForTeam."), Alive0, Alive1);
 		if (Killer && Killer->PlayerState)
 		{
-			RoundWinningKiller = Cast<AUTPlayerState>(Killer->PlayerState);
+			//RoundWinningKiller = Cast<AUTPlayerState>(Killer->PlayerState);
 			RoundWinningKillTime = GetWorld()->GetTimeSeconds();
 			if (Killer && Killer->GetPawn())
 			{
-				WinningKillerPawn = Killer->GetPawn();
+				RoundWinningKiller = Cast<AUTPlayerState>(Killer->PlayerState);
 			}
 			// Fallback to victim if killer is gone/invalid
-			else if (KilledPawn)
+			if (!RoundWinningKiller && OtherPS)
 			{
-				WinningKillerPawn = KilledPawn;
+				RoundWinningKiller = OtherPS;
+				UE_LOG(LogGameMode, Warning, TEXT("ScoreKill: Killer invalid, focusing replay on Victim: %s"), *OtherPS->PlayerName);
 			}
 			// CHECK FOR DARK HORSE REPLAY CONDITION
 			// If the killer was a tracked Dark Horse candidate, flag this for replay
@@ -1365,7 +1357,7 @@ void AUTeamArenaGame::SelectOptimalSpawnPairForTeam(int32 TeamIndex)
 	APlayerStart* PrimarySpawn = nullptr;
 	APlayerStart* SecondarySpawn = nullptr;
 
-	// NEW: Use multiple selection strategies and rotate between them
+	/* NEW: Use multiple selection strategies and rotate between them
 	int32 SelectionStrategy = CurrentRoundNumber % 3; // Rotate between 2 strategies
 
 	switch (SelectionStrategy)
@@ -1383,8 +1375,11 @@ void AUTeamArenaGame::SelectOptimalSpawnPairForTeam(int32 TeamIndex)
 		break;
 		
 	}
+	*/
 
-	//FindMaxDistanceSpawnPair(Candidates, EnemySpawns, PrimarySpawn, SecondarySpawn);
+
+
+	FindMaxDistanceSpawnPair(Candidates, EnemySpawns, PrimarySpawn, SecondarySpawn);
 	if (PrimarySpawn)
 	{
 		SelectedSpawns.Add(PrimarySpawn);
@@ -1431,34 +1426,35 @@ void AUTeamArenaGame::FindMaxDistanceSpawnPair(const TArray<FSpawnPointData*>& C
 		return;
 	}
 
-	// NEW: Add some randomness to weights each round
-	float RandomVariation = 0.1f; // 10% variation
+	// Weights (kept your randomization logic)
+	float RandomVariation = 0.1f;
 	float CurrentDistanceWeight = SpawnDistanceWeight + FMath::FRandRange(-RandomVariation, RandomVariation);
 	float CurrentHeightWeight = SpawnHeightWeight + FMath::FRandRange(-RandomVariation, RandomVariation);
 	float CurrentUsageWeight = SpawnUsageWeight + FMath::FRandRange(-RandomVariation, RandomVariation);
 	float CurrentSeparationWeight = SpawnSeparationWeight + FMath::FRandRange(-RandomVariation, RandomVariation);
 
-	// Normalize weights
 	float TotalWeight = CurrentDistanceWeight + CurrentHeightWeight + CurrentUsageWeight + CurrentSeparationWeight;
-	CurrentDistanceWeight /= TotalWeight;
-	CurrentHeightWeight /= TotalWeight;
-	CurrentUsageWeight /= TotalWeight;
-	CurrentSeparationWeight /= TotalWeight;
+	// Prevent divide by zero if weights are 0
+	if (TotalWeight > KINDA_SMALL_NUMBER)
+	{
+		CurrentDistanceWeight /= TotalWeight;
+		CurrentHeightWeight /= TotalWeight;
+		CurrentUsageWeight /= TotalWeight;
+		CurrentSeparationWeight /= TotalWeight;
+	}
 
-	float BestScore = -1.0f;
-	// FIX: Use a simpler structure instead of nested TPair
 	struct FSpawnPairScore
 	{
 		float Score;
 		int32 Index1;
 		int32 Index2;
-
-		FSpawnPairScore(float InScore, int32 InIndex1, int32 InIndex2)
-			: Score(InScore), Index1(InIndex1), Index2(InIndex2) {
-		}
+		FSpawnPairScore(float InScore, int32 InIndex1, int32 InIndex2) : Score(InScore), Index1(InIndex1), Index2(InIndex2) {}
 	};
 
 	TArray<FSpawnPairScore> ScoredPairs;
+
+	// SAFETY: Pre-calculate capacity to avoid reallocations
+	ScoredPairs.Reserve(CandidateSpawns.Num() * 2);
 
 	for (int32 i = 0; i < CandidateSpawns.Num(); ++i)
 	{
@@ -1471,18 +1467,13 @@ void AUTeamArenaGame::FindMaxDistanceSpawnPair(const TArray<FSpawnPointData*>& C
 			float MinDist1 = CalculateMinDistanceToEnemySpawns(Spawn1, EnemySpawns);
 			float MinDist2 = CalculateMinDistanceToEnemySpawns(Spawn2, EnemySpawns);
 
-			// --- NEW: Enforce Minimum Distance ---
-			// If enemy spawns exist, check distance.
-			if (EnemySpawns.Num() > 0 && (MinDist1 < MinimumEnemySpawnDistance || MinDist2 < MinimumEnemySpawnDistance))
-			{
-				continue; // This pair is too close to the enemy. Skip it.
-			}
-			// --- END NEW ---
-
 			float HeightScore1 = CandidateSpawns[i]->HeightScore;
 			float HeightScore2 = CandidateSpawns[j]->HeightScore;
+
+			// Usage score: Prefer lower usage
 			float UsageScore1 = 1.0f / (1.0f + CandidateSpawns[i]->GetUsageCountForTeam(0) + CandidateSpawns[i]->GetUsageCountForTeam(1));
 			float UsageScore2 = 1.0f / (1.0f + CandidateSpawns[j]->GetUsageCountForTeam(0) + CandidateSpawns[j]->GetUsageCountForTeam(1));
+
 			float SpawnSeparation = FVector::Dist(Spawn1->GetActorLocation(), Spawn2->GetActorLocation());
 			float SeparationScore = FMath::Min(SpawnSeparation / 1000.0f, 1.0f);
 
@@ -1491,9 +1482,22 @@ void AUTeamArenaGame::FindMaxDistanceSpawnPair(const TArray<FSpawnPointData*>& C
 				(UsageScore1 + UsageScore2) * CurrentUsageWeight +
 				SeparationScore * CurrentSeparationWeight;
 
-			// Add small random factor to break ties
-			CombinedScore += FMath::FRandRange(-0.01f, 0.01f);
+			// --- GRACEFUL DEGRADATION LOGIC ---
+			// If enemy spawns exist, apply the threshold check.
+			if (EnemySpawns.Num() > 0)
+			{
+				if (MinDist1 < MinimumEnemySpawnDistance || MinDist2 < MinimumEnemySpawnDistance)
+				{
+					// Instead of 'continue', we apply a massive penalty (-10000).
+					// This ensures these pairs are at the bottom of the list.
+					// However, because we still added 'CombinedScore' above, 
+					// a pair at 2400 units will still score higher than a pair at 500 units within this "bad" group.
+					CombinedScore -= 10000.0f;
+				}
+			}
+			// ----------------------------------
 
+			CombinedScore += FMath::FRandRange(-0.01f, 0.01f); // Tie-breaker
 			ScoredPairs.Add(FSpawnPairScore(CombinedScore, i, j));
 		}
 	}
@@ -1501,33 +1505,26 @@ void AUTeamArenaGame::FindMaxDistanceSpawnPair(const TArray<FSpawnPointData*>& C
 	if (ScoredPairs.Num() > 0)
 	{
 		// Sort by score (descending)
-		ScoredPairs.Sort([](const FSpawnPairScore& A, const FSpawnPairScore& B)
-			{
-				return A.Score > B.Score;
+		ScoredPairs.Sort([](const FSpawnPairScore& A, const FSpawnPairScore& B) {
+			return A.Score > B.Score;
 			});
 
-		// NEW: Instead of always picking the best, randomly select from top 3 pairs
-		int32 TopPairsToConsider = FMath::Min(2, ScoredPairs.Num());
-		int32 SelectedPairIndex = FMath::RandRange(0, TopPairsToConsider - 1);
+		// We removed the randomization here because we want the absolute best result
+		// (The randomization is already applied via the Weights at the top)
+		const FSpawnPairScore& SelectedPair = ScoredPairs[0];
 
-		const FSpawnPairScore& SelectedPair = ScoredPairs[SelectedPairIndex];
+		// DEBUG: Check if we were forced to use a sub-optimal spawn
+		if (SelectedPair.Score < -5000.0f)
+		{
+			UE_LOG(LogGameMode, Warning, TEXT("Spawn System: Could not find spawn > %f units. Using best available fallback."), MinimumEnemySpawnDistance);
+		}
 
 		APlayerStart* Spawn1 = CandidateSpawns[SelectedPair.Index1]->PlayerStart;
 		APlayerStart* Spawn2 = CandidateSpawns[SelectedPair.Index2]->PlayerStart;
 
-		float HeightScore1 = CandidateSpawns[SelectedPair.Index1]->HeightScore;
-		float HeightScore2 = CandidateSpawns[SelectedPair.Index2]->HeightScore;
-
-		if (HeightScore1 >= HeightScore2)
-		{
-			OutPrimary = Spawn1;
-			OutSecondary = Spawn2;
-		}
-		else
-		{
-			OutPrimary = Spawn2;
-			OutSecondary = Spawn1;
-		}
+		// Assign purely based on the pair logic
+		OutPrimary = Spawn1;
+		OutSecondary = Spawn2;
 	}
 }
 
