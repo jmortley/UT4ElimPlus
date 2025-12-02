@@ -62,6 +62,7 @@ AUTeamArenaGame::AUTeamArenaGame(const FObjectInitializer& ObjectInitializer)
 	WinningKillerPawn = nullptr;
 	RoundWinningKillTime = 0.0f;
 	bPendingDarkHorseReplay = false;
+	bWinByTwo = false;
 	//SpawnProtectionTime = 3.f;
 	bWarmupMode = false;
 	SpectateDelay = 2.f;
@@ -103,11 +104,8 @@ AUTeamArenaGame::AUTeamArenaGame(const FObjectInitializer& ObjectInitializer)
 	SpawnHeightWeight = 0.10f;
 	SpawnUsageWeight = 0.10f;
 	SpawnSeparationWeight = 0.15f;
-	MinimumEnemySpawnDistance = 2700.0f; // Minimum distance from enemy spawns
-	//PreferredEnemySpawnDistance = 3500.0f; // Preferred distance from enemy spawns
+	MinimumEnemySpawnDistance = 2800.0f; // Minimum distance from enemy spawns
 
-	// OvertimeDamageType = UDamageType::StaticClass(); // Already set above
-	//GameStateClass = AUTGameState::StaticClass();
 }
 
 
@@ -202,6 +200,11 @@ void AUTeamArenaGame::HandleMatchHasStarted()
 {
 
 	Super::HandleMatchHasStarted();
+
+	if (UTIsHandlingReplays() && GetGameInstance() != nullptr)
+	{
+		GetGameInstance()->StartRecordingReplay(TEXT(""), GetWorld()->GetMapName());
+	}
 	bWarmupMode = false;
 
 }
@@ -641,8 +644,26 @@ void AUTeamArenaGame::StartNextRound()
 	// Clear alive player arrays
 	Team0AlivePlayers.Empty();
 	Team1AlivePlayers.Empty();
+	// Draft Phase 1 (Initial Setup)
 	SelectOptimalSpawnPairForTeam(0);
 	SelectOptimalSpawnPairForTeam(1);
+	// Draft Phase 2 (Correction)
+	// Flip the "Last Mover" advantage every round so neither team can exploit it consistently.
+	if (TotalRoundsPlayed % 2 == 0)
+
+	{
+
+		SelectOptimalSpawnPairForTeam(0); // Team 0 gets the final adjustment
+
+	}
+
+	else
+
+	{
+
+		SelectOptimalSpawnPairForTeam(1); // Team 1 gets the final adjustment
+
+	}
 	// 2. Spawn players for the *new* round
 	bAllowPlayerRespawns = true; // Allow RestartPlayer to work
 	int32 PlayersSpawned = 0;
@@ -789,7 +810,7 @@ void AUTeamArenaGame::EndRoundForTeam(int32 WinnerTeamIndex, FName Reason)
 			FTimerHandle UnusedHandle;
 			FTimerDelegate TimerDel;
 			TimerDel.BindUFunction(this, FName("DelayedEndGame"), WinnerTeamIndex, FName(TEXT("ScoreLimit")));
-			GetWorldTimerManager().SetTimer(UnusedHandle, TimerDel, 3.0f, false);
+			GetWorldTimerManager().SetTimer(UnusedHandle, TimerDel, 1.0f, false);
 
 			return; // EXIT NOW, do not call EndGame immediately
 		}
@@ -822,6 +843,45 @@ void AUTeamArenaGame::EndRoundForTeam(int32 WinnerTeamIndex, FName Reason)
 
 	// Start the intermission timer
 	StartIntermission(AwardDisplayTime);
+}
+
+
+bool AUTeamArenaGame::CheckScore_Implementation(AUTPlayerState* Scorer)
+{
+	if (!Teams.IsValidIndex(0) || !Teams.IsValidIndex(1))
+	{
+		return false;
+	}
+
+	int32 ScoreA = Teams[0]->Score;
+	int32 ScoreB = Teams[1]->Score;
+
+	// No win-by-two fall back to normal UT logic
+	if (!bWinByTwo)
+	{
+		return Super::CheckScore_Implementation(Scorer);
+	}
+
+	// Normal UT fraglimit start condition
+	int32 LeadingScore = FMath::Max(ScoreA, ScoreB);
+	int32 TrailingScore = FMath::Min(ScoreA, ScoreB);
+
+	// Only allow victory if the leading team reached GoalScore
+	if (LeadingScore >= GoalScore)
+	{
+		// NOW apply Win-By-2 rule
+		if ((LeadingScore - TrailingScore) >= 2)
+		{
+			int32 WinnerTeamIndex = (ScoreA > ScoreB) ? 0 : 1;
+			AUTPlayerState* BestPlayer = FindBestPlayerOnTeam(WinnerTeamIndex);
+
+			EndGame(BestPlayer, TEXT("fraglimit"));
+			return true;
+		}
+	}
+
+	// No win yet
+	return false;
 }
 
 
@@ -1287,36 +1347,87 @@ void AUTeamArenaGame::InitializeSpawnPointSystem()
 void AUTeamArenaGame::ScoreAllSpawnPoints()
 {
 	if (AllSpawnPoints.Num() == 0) return;
+
+	// 1. Calculate Bounds (AABB) 
 	FVector MapMin = AllSpawnPoints[0].PlayerStart->GetActorLocation();
 	FVector MapMax = MapMin;
-	FVector MapCenter = FVector::ZeroVector;
+
 	for (const FSpawnPointData& SpawnData : AllSpawnPoints)
 	{
-		FVector Location = SpawnData.PlayerStart->GetActorLocation();
-		MapMin = FVector(FMath::Min(MapMin.X, Location.X), FMath::Min(MapMin.Y, Location.Y), FMath::Min(MapMin.Z, Location.Z));
-		MapMax = FVector(FMath::Max(MapMax.X, Location.X), FMath::Max(MapMax.Y, Location.Y), FMath::Max(MapMax.Z, Location.Z));
-		MapCenter += Location;
+		if (!SpawnData.PlayerStart) continue;
+
+		const FVector& Location = SpawnData.PlayerStart->GetActorLocation();
+		MapMin.X = FMath::Min(MapMin.X, Location.X);
+		MapMin.Y = FMath::Min(MapMin.Y, Location.Y);
+		MapMin.Z = FMath::Min(MapMin.Z, Location.Z);
+		MapMax.X = FMath::Max(MapMax.X, Location.X);
+		MapMax.Y = FMath::Max(MapMax.Y, Location.Y);
+		MapMax.Z = FMath::Max(MapMax.Z, Location.Z);
 	}
-	MapCenter /= AllSpawnPoints.Num();
-	FVector MapSize = MapMax - MapMin;
-	float ZRange = MapSize.Z;
+
+	// 2. Use Geometric Center
+	const FVector MapCenter = (MapMin + MapMax) * 0.5f;
+	const FVector MapExtents = (MapMax - MapMin) * 0.5f;
+	const FVector MapSize = MapMax - MapMin;
+
+	// 3. Determine the "Team Axis" (ALWAYS HORIZONTAL)
+	FVector TeamAxis = FVector(1.f, 0.f, 0.f); // Default to X 
+
+	// Check if map flows more along Y than X
+	// Note: We deliberately IGNORE Z for Team Axis determination.
+	if (MapSize.Y > MapSize.X)
+	{
+		TeamAxis = FVector(0.f, 1.f, 0.f); // North/South 
+	}
+	// Handle diagonal maps (X and Y within 25% of each other)
+	else if (FMath::Abs(MapSize.X - MapSize.Y) < MapSize.X * 0.25f)
+	{
+		// Variance Check: Which diagonal actually matches the spawn spread?
+		const FVector Diag1 = FVector(1.f, 1.f, 0.f).GetSafeNormal(); // BL to TR
+		const FVector Diag2 = FVector(1.f, -1.f, 0.f).GetSafeNormal(); // TL to BR
+
+		float Variance1 = 0.f;
+		float Variance2 = 0.f;
+
+		for (const FSpawnPointData& Spawn : AllSpawnPoints)
+		{
+			if (Spawn.PlayerStart)
+			{
+				// Flatten to 2D for diagonal check
+				FVector Rel = (Spawn.PlayerStart->GetActorLocation() - MapCenter);
+				Rel.Z = 0.f;
+				Variance1 += FMath::Abs(FVector::DotProduct(Rel, Diag1));
+				Variance2 += FMath::Abs(FVector::DotProduct(Rel, Diag2));
+			}
+		}
+
+		TeamAxis = (Variance1 > Variance2) ? Diag1 : Diag2;
+	}
+
+	// Pre-calculate the maximum projection distance
+	const float MaxProjectionDist = FMath::Abs(FVector::DotProduct(MapExtents, TeamAxis));
+	const bool bHasValidProjection = MaxProjectionDist > 1.0f;
+	const bool bHasValidHeight = MapSize.Z > 100.f; // Still useful for HeightScore
+
+	// 4. Score all spawn points 
 	for (FSpawnPointData& SpawnData : AllSpawnPoints)
 	{
-		FVector Location = SpawnData.PlayerStart->GetActorLocation();
-		SpawnData.HeightScore = (ZRange > 0) ? ((Location.Z - MapMin.Z) / ZRange) : 0.5f;
-		FVector RelativePos = Location - MapCenter;
-		float LargestAxis = FMath::Max3(MapSize.X, MapSize.Y, MapSize.Z);
-		if (LargestAxis > 0)
+		if (!SpawnData.PlayerStart) continue;
+
+		const FVector& Location = SpawnData.PlayerStart->GetActorLocation();
+
+		// --- Calculate Height Score (Z-Relative) --- 
+		// We keep this because "High Ground" is a quality metric, even if not a team metric.
+		SpawnData.HeightScore = bHasValidHeight
+			? ((Location.Z - MapMin.Z) / MapSize.Z)
+			: 0.5f;
+
+		// --- Calculate TeamSideScore via Projection ---
+		if (bHasValidProjection)
 		{
-			FVector NormalizedPos = RelativePos / LargestAxis;
-			if (FMath::Abs(MapSize.X) >= FMath::Abs(MapSize.Y))
-			{
-				SpawnData.TeamSideScore = NormalizedPos.X;
-			}
-			else
-			{
-				SpawnData.TeamSideScore = NormalizedPos.Y;
-			}
+			const FVector RelativePos = Location - MapCenter;
+			const float ProjectedDist = FVector::DotProduct(RelativePos, TeamAxis);
+			SpawnData.TeamSideScore = FMath::Clamp(ProjectedDist / MaxProjectionDist, -1.0f, 1.0f);
 		}
 		else
 		{
@@ -2535,7 +2646,7 @@ void AUTeamArenaGame::StartOvertime()
 		false
 	);
 	BP_OnOvertimeStarted();
-	UE_LOG(LogGameMode, Warning, TEXT("Overtime started! First wave in %.1f seconds with %.1f damage"),
+	UE_LOG(LogGameMode, Warning, TEXT("Overtime has started! First wave in %.1f seconds with %.1f damage"),
 		OvertimeStartDelay, OvertimeBaseDamage);
 }
 
@@ -2760,13 +2871,38 @@ void AUTeamArenaGame::BP_RestartCurrentRound()
 
 	// Reset spawn selection for the new round attempt
 	ResetSpawnSelectionForNewRound();
+
+	// Draft Phase 1 (Initial Setup)
+
 	SelectOptimalSpawnPairForTeam(0);
+
 	SelectOptimalSpawnPairForTeam(1);
+
+	// Draft Phase 2 (Correction)
+
+	// Flip the "Last Mover" advantage every round so neither team can exploit it consistently.
+
+	if (TotalRoundsPlayed % 2 == 0)
+
+	{
+
+		SelectOptimalSpawnPairForTeam(0); // Team 0 gets the final adjustment
+
+	}
+
+	else
+
+	{
+
+		SelectOptimalSpawnPairForTeam(1); // Team 1 gets the final adjustment
+
+	}
+
 	// Start a brief intermission before the new round (3 seconds)
-	StartIntermission(3);
+	StartIntermission(4);
 
 	// Broadcast a message to let everyone know the round was restarted
-	BroadcastLocalized(this, UUTGameMessage::StaticClass(), 10, nullptr, nullptr, nullptr); // You might want to create a custom message for this
+	//BroadcastLocalized(this, UUTGameMessage::StaticClass(), 10, nullptr, nullptr, nullptr); // You might want to create a custom message for this
 }
 
 void AUTeamArenaGame::Logout(AController* Exiting)
@@ -2799,15 +2935,15 @@ void AUTeamArenaGame::InitGameState()
 	// CRITICAL FIX: Only change GameModeClass on clients for compatibility
 	// Server needs to keep the real C++ class, but clients without the plugin
 	// need a fallback class they can load
+	
+	if (AUTGameState* GS = GetGameState<AUTGameState>())
+	{
+		// Set GameModeClass to the parent class that all clients have
+		GS->GameModeClass = AUTTeamGameMode::StaticClass();
 
-		if (AUTGameState* GS = GetGameState<AUTGameState>())
-		{
-			// Set GameModeClass to the parent class that all clients have
-			GS->GameModeClass = AUTTeamGameMode::StaticClass();
-
-			UE_LOG(LogGameMode, Warning, TEXT("InitGameState: - Set GameModeClass to UTTeamGameMode for compatibility"));
-		}
-
+		UE_LOG(LogGameMode, Warning, TEXT("InitGameState: - Set GameModeClass to UTTeamGameMode for compatibility"));
+	}
+	
 }
 
 

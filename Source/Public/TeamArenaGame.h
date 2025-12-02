@@ -128,6 +128,9 @@ public:
 	UPROPERTY(VisibleInstanceOnly, BlueprintReadOnly, Category = "Arena|State")
 	int32 TotalRoundsPlayed;
 
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "WinBy2")
+	bool bWinByTwo = false;
+
 	/** Restart the current round - useful for handling disconnections or other issues during official matches */
 	UFUNCTION(BlueprintCallable, Category = "TeamArena|Round Control")
 	void BP_RestartCurrentRound();
@@ -286,6 +289,8 @@ public:
 	virtual void CallMatchStateChangeNotify() override;
 	virtual bool ModifyDamage_Implementation(int32& Damage, FVector& Momentum, APawn* Injured, AController* InstigatedBy, const FHitResult& HitInfo, AActor* DamageCauser, TSubclassOf<UDamageType> DamageType) override;
 
+	/** Override core UT score check to allow win by 2 */
+	virtual bool CheckScore_Implementation(AUTPlayerState* Scorer) override;
 
 	// In UE4 these are valid overrides on AGameMode*
 	virtual AActor* ChoosePlayerStart_Implementation(AController* Player) override;
