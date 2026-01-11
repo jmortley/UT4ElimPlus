@@ -178,8 +178,8 @@ void AUTeamArenaGame::BeginPlay()
 		bSpawnPointsInitialized = true;
 	}
 	//GetWorldTimerManager().SetTimerForNextTick([this]()
-	GetWorldTimerManager().SetTimerForNextTick(this, &AUTeamArenaGame::DeferredHandleMatchStart);
-	UE_LOG(LogTemp, Error, TEXT("GameMode::BeginPlay called"));
+	//GetWorldTimerManager().SetTimerForNextTick(this, &AUTeamArenaGame::DeferredHandleMatchStart);
+	//UE_LOG(LogTemp, Error, TEXT("GameMode::BeginPlay called"));
 
 
 	//GetWorldTimerManager().SetTimerForNextTick(this, &AUTeamArenaGame::DeferredCheckRoundWinConditions);
@@ -212,7 +212,7 @@ void AUTeamArenaGame::HandleMatchHasStarted()
 
 void AUTeamArenaGame::CallMatchStateChangeNotify()
 {
-	//UE_LOG(LogGameMode, Log, TEXT("Current matchstate: %s"), *GetMatchState().ToString());
+	UE_LOG(LogGameMode, Log, TEXT("Current matchstate: %s"), *GetMatchState().ToString());
 	// This function intercepts all SetMatchState calls
 	// and routes them to our custom handlers.
 	if (GetMatchState() == MatchState::WaitingToStart)
@@ -230,9 +230,10 @@ void AUTeamArenaGame::CallMatchStateChangeNotify()
 	{
 		HandleMatchIntermission();
 	}
-	else if (GetMatchState() == MatchState::InProgress && GetWorld()->bMatchStarted)
+	else if (GetMatchState() == MatchState::InProgress)// && GetWorld()->bMatchStarted)
 	{
 		// We are transitioning *to* InProgress, so start the new round
+		bWarmupMode = false;
 		StartNextRound();
 	}
 	else
@@ -403,6 +404,9 @@ void AUTeamArenaGame::HandleServerManagement()
 		if (DemoNetDriver != nullptr && DemoNetDriver->ReplayStreamer.IsValid())
 		{
 			UTGameState->ReplayID = DemoNetDriver->ReplayStreamer->GetReplayID();
+		}
+		else {
+			UE_LOG(LogGameMode, Warning, TEXT("ReplayFailed HandleServerManagement"));
 		}
 	}
 }
@@ -640,7 +644,7 @@ void AUTeamArenaGame::StartNextRound()
 	ResetPlayersForNewRound();
 	ResetSpawnSelectionForNewRound();
 	DarkHorseCandidates.Empty();
-
+	ScoreAllSpawnPoints();
 	// Clear alive player arrays
 	Team0AlivePlayers.Empty();
 	Team1AlivePlayers.Empty();
@@ -791,7 +795,7 @@ void AUTeamArenaGame::EndRoundForTeam(int32 WinnerTeamIndex, FName Reason)
 		UE_LOG(LogGameMode, Warning, TEXT("Round draw - no score change"));
 	}
 
-	// --- Check for Game End ---
+	/* -- - Check for Game End-- -
 	if (!bIsDraw && Teams[WinnerTeamIndex]->Score >= GoalScore)
 	{
 		// Game Over
@@ -819,6 +823,53 @@ void AUTeamArenaGame::EndRoundForTeam(int32 WinnerTeamIndex, FName Reason)
 		
 		return; // Do not proceed to intermission
 		
+	}
+	*/
+	if (!bIsDraw && Teams[WinnerTeamIndex]->Score >= GoalScore)
+	{
+		// Check win-by-two requirement if enabled
+		bool bCanEndMatch = true;
+		if (bWinByTwo)
+		{
+			int32 OtherTeamIndex = (WinnerTeamIndex == 0) ? 1 : 0;
+			if (Teams.IsValidIndex(OtherTeamIndex))
+			{
+				int32 ScoreDifference = Teams[WinnerTeamIndex]->Score - Teams[OtherTeamIndex]->Score;
+				bCanEndMatch = (ScoreDifference >= 2);
+
+				if (!bCanEndMatch)
+				{
+					UE_LOG(LogGameMode, Warning, TEXT("Win-by-two not met: Team %d has %d, Team %d has %d (diff: %d)"),
+						WinnerTeamIndex, Teams[WinnerTeamIndex]->Score,
+						OtherTeamIndex, Teams[OtherTeamIndex]->Score,
+						ScoreDifference);
+				}
+			}
+		}
+
+		if (bCanEndMatch)
+		{
+			// Game Over
+			bool bReplayTriggered = false;
+			BroadcastKillReplay();
+			bReplayTriggered = true;
+
+			UE_LOG(LogGameMode, Warning, TEXT("Team %d has won the match. Ending game."), WinnerTeamIndex);
+			if (bReplayTriggered)
+			{
+				// DELAY EndGame so the replay can actually play.
+				// 7.0 seconds gives time for the 0.5s delay + ~6s of replay footage
+				FTimerHandle UnusedHandle;
+				FTimerDelegate TimerDel;
+				TimerDel.BindUFunction(this, FName("DelayedEndGame"), WinnerTeamIndex, FName(TEXT("ScoreLimit")));
+				GetWorldTimerManager().SetTimer(UnusedHandle, TimerDel, 1.0f, false);
+
+				return; // EXIT NOW, do not call EndGame immediately
+			}
+
+			return; // Do not proceed to intermission
+		}
+		// else: Win-by-two not satisfied, fall through to intermission
 	}
 
 	// --- Game is NOT over, proceed to intermission ---
@@ -1370,44 +1421,42 @@ void AUTeamArenaGame::ScoreAllSpawnPoints()
 	const FVector MapExtents = (MapMax - MapMin) * 0.5f;
 	const FVector MapSize = MapMax - MapMin;
 
-	// 3. Determine the "Team Axis" (ALWAYS HORIZONTAL)
-	FVector TeamAxis = FVector(1.f, 0.f, 0.f); // Default to X 
+	// 3. Determine the "Team Axis" based on Round Rotation
+	FVector TeamAxis = FVector(1.f, 0.f, 0.f);
 
-	// Check if map flows more along Y than X
-	// Note: We deliberately IGNORE Z for Team Axis determination.
-	if (MapSize.Y > MapSize.X)
+	int32 CycleStep = CurrentRoundNumber % 4;
+
+	switch (CycleStep)
 	{
-		TeamAxis = FVector(0.f, 1.f, 0.f); // North/South 
+	case 1: // Round 1, 5, 9...
+		// Axis: Standard X (East)
+		TeamAxis = FVector(1.f, 0.f, 0.f);
+		break;
+
+	case 2: // Round 2, 6, 10...
+		// Axis: Inverted Y (South)
+		TeamAxis = FVector(0.f, -1.f, 0.f);
+		break;
+
+	case 3: // Round 3, 7, 11...
+		// Axis: Inverted X (West)
+		TeamAxis = FVector(-1.f, 0.f, 0.f);
+		break;
+
+	case 0: // Round 4, 8, 12...
+		// Axis: Standard Y (North)
+		TeamAxis = FVector(0.f, 1.f, 0.f);
+		break;
 	}
-	// Handle diagonal maps (X and Y within 25% of each other)
-	else if (FMath::Abs(MapSize.X - MapSize.Y) < MapSize.X * 0.25f)
-	{
-		// Variance Check: Which diagonal actually matches the spawn spread?
-		const FVector Diag1 = FVector(1.f, 1.f, 0.f).GetSafeNormal(); // BL to TR
-		const FVector Diag2 = FVector(1.f, -1.f, 0.f).GetSafeNormal(); // TL to BR
 
-		float Variance1 = 0.f;
-		float Variance2 = 0.f;
-
-		for (const FSpawnPointData& Spawn : AllSpawnPoints)
-		{
-			if (Spawn.PlayerStart)
-			{
-				// Flatten to 2D for diagonal check
-				FVector Rel = (Spawn.PlayerStart->GetActorLocation() - MapCenter);
-				Rel.Z = 0.f;
-				Variance1 += FMath::Abs(FVector::DotProduct(Rel, Diag1));
-				Variance2 += FMath::Abs(FVector::DotProduct(Rel, Diag2));
-			}
-		}
-
-		TeamAxis = (Variance1 > Variance2) ? Diag1 : Diag2;
-	}
+	// !!! IMPORTANT: I REMOVED THE DIAGONAL CHECK HERE !!!
+	// If you leave the diagonal check, it will overwrite your TeamAxis 
+	// on square maps like DM-Pending.
 
 	// Pre-calculate the maximum projection distance
 	const float MaxProjectionDist = FMath::Abs(FVector::DotProduct(MapExtents, TeamAxis));
 	const bool bHasValidProjection = MaxProjectionDist > 1.0f;
-	const bool bHasValidHeight = MapSize.Z > 100.f; // Still useful for HeightScore
+	const bool bHasValidHeight = MapSize.Z > 100.f;
 
 	// 4. Score all spawn points 
 	for (FSpawnPointData& SpawnData : AllSpawnPoints)
@@ -1417,7 +1466,6 @@ void AUTeamArenaGame::ScoreAllSpawnPoints()
 		const FVector& Location = SpawnData.PlayerStart->GetActorLocation();
 
 		// --- Calculate Height Score (Z-Relative) --- 
-		// We keep this because "High Ground" is a quality metric, even if not a team metric.
 		SpawnData.HeightScore = bHasValidHeight
 			? ((Location.Z - MapMin.Z) / MapSize.Z)
 			: 0.5f;
@@ -2932,7 +2980,7 @@ void AUTeamArenaGame::InitGameState()
 {
 	Super::InitGameState();
 
-	// CRITICAL FIX: Only change GameModeClass on clients for compatibility
+	// CRITICAL FIX : Only change GameModeClass on clients for compatibility
 	// Server needs to keep the real C++ class, but clients without the plugin
 	// need a fallback class they can load
 	
@@ -2943,7 +2991,7 @@ void AUTeamArenaGame::InitGameState()
 
 		UE_LOG(LogGameMode, Warning, TEXT("InitGameState: - Set GameModeClass to UTTeamGameMode for compatibility"));
 	}
-	
+
 }
 
 
