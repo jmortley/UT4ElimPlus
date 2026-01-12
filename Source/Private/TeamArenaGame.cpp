@@ -1585,15 +1585,14 @@ void AUTeamArenaGame::FindMaxDistanceSpawnPair(const TArray<FSpawnPointData*>& C
 		return;
 	}
 
-	// Weights (kept your randomization logic)
-	float RandomVariation = 0.1f;
-	float CurrentDistanceWeight = SpawnDistanceWeight + FMath::FRandRange(-RandomVariation, RandomVariation);
-	float CurrentHeightWeight = SpawnHeightWeight + FMath::FRandRange(-RandomVariation, RandomVariation);
-	float CurrentUsageWeight = SpawnUsageWeight + FMath::FRandRange(-RandomVariation, RandomVariation);
-	float CurrentSeparationWeight = SpawnSeparationWeight + FMath::FRandRange(-RandomVariation, RandomVariation);
+	// --- Use strict deterministic weights ---
+	// Remove FMath::FRandRange calls. Use the raw values set in constructor.
+	float CurrentDistanceWeight = SpawnDistanceWeight;
+	float CurrentHeightWeight = SpawnHeightWeight;
+	float CurrentUsageWeight = SpawnUsageWeight;
+	float CurrentSeparationWeight = SpawnSeparationWeight;
 
 	float TotalWeight = CurrentDistanceWeight + CurrentHeightWeight + CurrentUsageWeight + CurrentSeparationWeight;
-	// Prevent divide by zero if weights are 0
 	if (TotalWeight > KINDA_SMALL_NUMBER)
 	{
 		CurrentDistanceWeight /= TotalWeight;
@@ -1601,6 +1600,7 @@ void AUTeamArenaGame::FindMaxDistanceSpawnPair(const TArray<FSpawnPointData*>& C
 		CurrentUsageWeight /= TotalWeight;
 		CurrentSeparationWeight /= TotalWeight;
 	}
+	// --- FIX END ---
 
 	struct FSpawnPairScore
 	{
@@ -2294,9 +2294,9 @@ void AUTeamArenaGame::CheckLastManStanding(int32 Alive0, int32 Alive1)
 		BroadcastLastManStanding(0, ClutchPlayer);
 		bTeam0LastManAnnounced = true;
 		// NEW: Track dark horse potential - Team0 player is now 1 vs Alive1 enemies
-		if (ClutchPlayer && Alive1 >= 2)
+		if (ClutchPlayer && Alive1 >= 3)
 		{
-			// This player is now in a 1v2+ situation - mark them as a dark horse candidate
+			// This player is now in a 1v3+ situation - mark them as a dark horse candidate
 			if (!DarkHorseCandidates.Contains(ClutchPlayer))
 			{
 				DarkHorseCandidates.Add(ClutchPlayer, Alive1); // Store how many enemies they're facing
@@ -2316,9 +2316,9 @@ void AUTeamArenaGame::CheckLastManStanding(int32 Alive0, int32 Alive1)
 		BroadcastLastManStanding(1, ClutchPlayer);
 		bTeam1LastManAnnounced = true;
 		// NEW: Track dark horse potential - Team1 player is now 1 vs Alive0 enemies
-		if (ClutchPlayer && Alive0 >= 2)
+		if (ClutchPlayer && Alive0 >= 3)
 		{
-			// This player is now in a 1v2+ situation - mark them as a dark horse candidate
+			// This player is now in a 1v3+ situation - mark them as a dark horse candidate
 			if (!DarkHorseCandidates.Contains(ClutchPlayer))
 			{
 				DarkHorseCandidates.Add(ClutchPlayer, Alive0); // Store how many enemies they're facing
