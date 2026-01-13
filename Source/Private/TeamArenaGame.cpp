@@ -45,7 +45,7 @@ AUTeamArenaGame::AUTeamArenaGame(const FObjectInitializer& ObjectInitializer)
 	LastManStandingSound = nullptr;
 	EnemyLastManStandingSound = nullptr;
 	OvertimeAnnouncementSound = nullptr;
-
+	bRecordReplays = true;
 	// Round defaults
 	bForceRespawn = false;
 	bHasRespawnChoices = false;
@@ -201,10 +201,6 @@ void AUTeamArenaGame::HandleMatchHasStarted()
 
 	Super::HandleMatchHasStarted();
 
-	if (UTIsHandlingReplays() && GetGameInstance() != nullptr)
-	{
-		GetGameInstance()->StartRecordingReplay(TEXT(""), GetWorld()->GetMapName());
-	}
 	bWarmupMode = false;
 
 }
@@ -404,9 +400,6 @@ void AUTeamArenaGame::HandleServerManagement()
 		if (DemoNetDriver != nullptr && DemoNetDriver->ReplayStreamer.IsValid())
 		{
 			UTGameState->ReplayID = DemoNetDriver->ReplayStreamer->GetReplayID();
-		}
-		else {
-			UE_LOG(LogGameMode, Warning, TEXT("ReplayFailed HandleServerManagement"));
 		}
 	}
 }
