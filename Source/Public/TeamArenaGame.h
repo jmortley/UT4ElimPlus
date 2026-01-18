@@ -80,6 +80,25 @@ struct FSpawnPointData
 	}
 };
 
+USTRUCT()
+struct FCamperData
+{
+	GENERATED_BODY()
+
+	FVector LocationHistory[10];
+	int32 NextSlot = 0;
+	bool bHasFullHistory = false;
+	float LastPunishTime = 0.0f;
+	int32 ConsecutiveCampCount = 0;
+	bool bWarned = false;
+
+	FCamperData()
+	{
+		for (int i = 0; i < 10; i++) LocationHistory[i] = FVector::ZeroVector;
+	}
+};
+
+
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnPlayerACE, AUTPlayerState*, PlayerState);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnPlayerDarkHorse, AUTPlayerState*, PlayerState, int32, EnemiesKilled);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnPlayerHighDamageCarry, AUTPlayerState*, PlayerState, float, DamagePercentage);
@@ -137,6 +156,10 @@ public:
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spectating")
 	bool useBPSpecFunction;
+
+	/** If true, the game will automatically pause if a player disconnects mid-match. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Arena|Rules")
+	bool bCompetitiveAutoPause;
 
 	// Blueprint-implementable function for spectating
 	UFUNCTION(BlueprintImplementableEvent, Category = "Spectating")
@@ -337,8 +360,49 @@ public:
 
 	void BroadcastOvertimeAnnouncement();
 
+	// -------- Anti-Camp Configuration --------
+
+	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Arena|AntiCamp")
+	bool bEnableAntiCamp = true;
+
+	/** Dimensions of the box (radius/extent) a player must stay within to be flagged */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Arena|AntiCamp")
+	float CampThreshold = 400.0f;
+
+	/** How often (in seconds) to sample positions and check for camping */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Arena|AntiCamp")
+	float CampCheckInterval = 1.0f;
+
+	/** Minimum time between punishments/warnings (in seconds) */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Arena|AntiCamp")
+	float CampWarnCooldown = 5.0f;
+
+	// -------- Anti-Camp Events --------
+
+	/** * Triggered when camping is detected.
+	 * @param CamperPS - The player detected.
+	 * @param CampCount - How many consecutive checks they have failed (1 = Warning, 4+ = Kick/Kill?)
+	 */
+	UFUNCTION(BlueprintImplementableEvent, Category = "Arena|AntiCamp")
+	void BP_OnCamperDetected(AUTPlayerState* CamperPS, int32 CampCount);
+
+	/** Triggered when a player moves enough to clear their camping status (useful to hide UI warnings) */
+	UFUNCTION(BlueprintImplementableEvent, Category = "Arena|AntiCamp")
+	void BP_OnCamperClear(AUTPlayerState* CamperPS);
+
 
 protected:
+	/** Map to store history for each player without modifying PlayerState class */
+    TMap<TWeakObjectPtr<AUTPlayerState>, FCamperData> CamperTracker;
+
+    FTimerHandle TimerHandle_CampCheck;
+
+    void StartCampCheckTimer();
+    void StopCampCheckTimer();
+    
+    UFUNCTION()
+    void CheckForCampers();
+
 	// -------- Round flow --------
 	UPROPERTY()
 	AUTPlayerState* RoundWinningKiller;

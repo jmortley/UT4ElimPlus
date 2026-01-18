@@ -45,7 +45,7 @@ AUTeamArenaGame::AUTeamArenaGame(const FObjectInitializer& ObjectInitializer)
 	LastManStandingSound = nullptr;
 	EnemyLastManStandingSound = nullptr;
 	OvertimeAnnouncementSound = nullptr;
-
+	bRecordReplays = true;
 	// Round defaults
 	bForceRespawn = false;
 	bHasRespawnChoices = false;
@@ -76,6 +76,7 @@ AUTeamArenaGame::AUTeamArenaGame(const FObjectInitializer& ObjectInitializer)
 	bTeam1LastManAnnounced = false;
 	Team0RoundDamage = 0;
 	Team1RoundDamage = 0;
+	bCompetitiveAutoPause = false;
 
 	// Initialize score tracking for domination/lead detection
 	PreviousRedScore = 0;
@@ -178,8 +179,8 @@ void AUTeamArenaGame::BeginPlay()
 		bSpawnPointsInitialized = true;
 	}
 	//GetWorldTimerManager().SetTimerForNextTick([this]()
-	GetWorldTimerManager().SetTimerForNextTick(this, &AUTeamArenaGame::DeferredHandleMatchStart);
-	UE_LOG(LogTemp, Error, TEXT("GameMode::BeginPlay called"));
+	//GetWorldTimerManager().SetTimerForNextTick(this, &AUTeamArenaGame::DeferredHandleMatchStart);
+	//UE_LOG(LogTemp, Error, TEXT("GameMode::BeginPlay called"));
 
 
 	//GetWorldTimerManager().SetTimerForNextTick(this, &AUTeamArenaGame::DeferredCheckRoundWinConditions);
@@ -201,10 +202,6 @@ void AUTeamArenaGame::HandleMatchHasStarted()
 
 	Super::HandleMatchHasStarted();
 
-	if (UTIsHandlingReplays() && GetGameInstance() != nullptr)
-	{
-		GetGameInstance()->StartRecordingReplay(TEXT(""), GetWorld()->GetMapName());
-	}
 	bWarmupMode = false;
 
 }
@@ -212,7 +209,7 @@ void AUTeamArenaGame::HandleMatchHasStarted()
 
 void AUTeamArenaGame::CallMatchStateChangeNotify()
 {
-	//UE_LOG(LogGameMode, Log, TEXT("Current matchstate: %s"), *GetMatchState().ToString());
+	UE_LOG(LogGameMode, Log, TEXT("Current matchstate: %s"), *GetMatchState().ToString());
 	// This function intercepts all SetMatchState calls
 	// and routes them to our custom handlers.
 	if (GetMatchState() == MatchState::WaitingToStart)
@@ -230,9 +227,10 @@ void AUTeamArenaGame::CallMatchStateChangeNotify()
 	{
 		HandleMatchIntermission();
 	}
-	else if (GetMatchState() == MatchState::InProgress && GetWorld()->bMatchStarted)
+	else if (GetMatchState() == MatchState::InProgress)// && GetWorld()->bMatchStarted)
 	{
 		// We are transitioning *to* InProgress, so start the new round
+		bWarmupMode = false;
 		StartNextRound();
 	}
 	else
@@ -626,6 +624,11 @@ void AUTeamArenaGame::StartNextRound()
 	}
 
 	// Reset per-round trackers
+	// Clear old camper data
+	CamperTracker.Empty();
+
+	// Start the check timer
+	StartCampCheckTimer();
 	RoundWinningKiller = nullptr;
 	RoundWinningKillTime = 0.0f;
 	bPendingDarkHorseReplay = false;
@@ -640,7 +643,7 @@ void AUTeamArenaGame::StartNextRound()
 	ResetPlayersForNewRound();
 	ResetSpawnSelectionForNewRound();
 	DarkHorseCandidates.Empty();
-
+	ScoreAllSpawnPoints();
 	// Clear alive player arrays
 	Team0AlivePlayers.Empty();
 	Team1AlivePlayers.Empty();
@@ -762,6 +765,7 @@ void AUTeamArenaGame::EndRoundForTeam(int32 WinnerTeamIndex, FName Reason)
 	}
 
 	// Stop the round *immediately*
+	StopCampCheckTimer();
 	bRoundInProgress = false;
 	RoundEndTimeSeconds = 0.f;
 	LastRoundWinningTeamIndex = WinnerTeamIndex;
@@ -791,7 +795,7 @@ void AUTeamArenaGame::EndRoundForTeam(int32 WinnerTeamIndex, FName Reason)
 		UE_LOG(LogGameMode, Warning, TEXT("Round draw - no score change"));
 	}
 
-	// --- Check for Game End ---
+	/* -- - Check for Game End-- -
 	if (!bIsDraw && Teams[WinnerTeamIndex]->Score >= GoalScore)
 	{
 		// Game Over
@@ -819,6 +823,53 @@ void AUTeamArenaGame::EndRoundForTeam(int32 WinnerTeamIndex, FName Reason)
 		
 		return; // Do not proceed to intermission
 		
+	}
+	*/
+	if (!bIsDraw && Teams[WinnerTeamIndex]->Score >= GoalScore)
+	{
+		// Check win-by-two requirement if enabled
+		bool bCanEndMatch = true;
+		if (bWinByTwo)
+		{
+			int32 OtherTeamIndex = (WinnerTeamIndex == 0) ? 1 : 0;
+			if (Teams.IsValidIndex(OtherTeamIndex))
+			{
+				int32 ScoreDifference = Teams[WinnerTeamIndex]->Score - Teams[OtherTeamIndex]->Score;
+				bCanEndMatch = (ScoreDifference >= 2);
+
+				if (!bCanEndMatch)
+				{
+					UE_LOG(LogGameMode, Warning, TEXT("Win-by-two not met: Team %d has %d, Team %d has %d (diff: %d)"),
+						WinnerTeamIndex, Teams[WinnerTeamIndex]->Score,
+						OtherTeamIndex, Teams[OtherTeamIndex]->Score,
+						ScoreDifference);
+				}
+			}
+		}
+
+		if (bCanEndMatch)
+		{
+			// Game Over
+			bool bReplayTriggered = false;
+			BroadcastKillReplay();
+			bReplayTriggered = true;
+
+			UE_LOG(LogGameMode, Warning, TEXT("Team %d has won the match. Ending game."), WinnerTeamIndex);
+			if (bReplayTriggered)
+			{
+				// DELAY EndGame so the replay can actually play.
+				// 7.0 seconds gives time for the 0.5s delay + ~6s of replay footage
+				FTimerHandle UnusedHandle;
+				FTimerDelegate TimerDel;
+				TimerDel.BindUFunction(this, FName("DelayedEndGame"), WinnerTeamIndex, FName(TEXT("ScoreLimit")));
+				GetWorldTimerManager().SetTimer(UnusedHandle, TimerDel, 1.0f, false);
+
+				return; // EXIT NOW, do not call EndGame immediately
+			}
+
+			return; // Do not proceed to intermission
+		}
+		// else: Win-by-two not satisfied, fall through to intermission
 	}
 
 	// --- Game is NOT over, proceed to intermission ---
@@ -1370,44 +1421,42 @@ void AUTeamArenaGame::ScoreAllSpawnPoints()
 	const FVector MapExtents = (MapMax - MapMin) * 0.5f;
 	const FVector MapSize = MapMax - MapMin;
 
-	// 3. Determine the "Team Axis" (ALWAYS HORIZONTAL)
-	FVector TeamAxis = FVector(1.f, 0.f, 0.f); // Default to X 
+	// 3. Determine the "Team Axis" based on Round Rotation
+	FVector TeamAxis = FVector(1.f, 0.f, 0.f);
 
-	// Check if map flows more along Y than X
-	// Note: We deliberately IGNORE Z for Team Axis determination.
-	if (MapSize.Y > MapSize.X)
+	int32 CycleStep = CurrentRoundNumber % 4;
+
+	switch (CycleStep)
 	{
-		TeamAxis = FVector(0.f, 1.f, 0.f); // North/South 
+	case 1: // Round 1, 5, 9...
+		// Axis: Standard X (East)
+		TeamAxis = FVector(1.f, 0.f, 0.f);
+		break;
+
+	case 2: // Round 2, 6, 10...
+		// Axis: Inverted Y (South)
+		TeamAxis = FVector(0.f, -1.f, 0.f);
+		break;
+
+	case 3: // Round 3, 7, 11...
+		// Axis: Inverted X (West)
+		TeamAxis = FVector(-1.f, 0.f, 0.f);
+		break;
+
+	case 0: // Round 4, 8, 12...
+		// Axis: Standard Y (North)
+		TeamAxis = FVector(0.f, 1.f, 0.f);
+		break;
 	}
-	// Handle diagonal maps (X and Y within 25% of each other)
-	else if (FMath::Abs(MapSize.X - MapSize.Y) < MapSize.X * 0.25f)
-	{
-		// Variance Check: Which diagonal actually matches the spawn spread?
-		const FVector Diag1 = FVector(1.f, 1.f, 0.f).GetSafeNormal(); // BL to TR
-		const FVector Diag2 = FVector(1.f, -1.f, 0.f).GetSafeNormal(); // TL to BR
 
-		float Variance1 = 0.f;
-		float Variance2 = 0.f;
-
-		for (const FSpawnPointData& Spawn : AllSpawnPoints)
-		{
-			if (Spawn.PlayerStart)
-			{
-				// Flatten to 2D for diagonal check
-				FVector Rel = (Spawn.PlayerStart->GetActorLocation() - MapCenter);
-				Rel.Z = 0.f;
-				Variance1 += FMath::Abs(FVector::DotProduct(Rel, Diag1));
-				Variance2 += FMath::Abs(FVector::DotProduct(Rel, Diag2));
-			}
-		}
-
-		TeamAxis = (Variance1 > Variance2) ? Diag1 : Diag2;
-	}
+	// !!! IMPORTANT: I REMOVED THE DIAGONAL CHECK HERE !!!
+	// If you leave the diagonal check, it will overwrite your TeamAxis 
+	// on square maps like DM-Pending.
 
 	// Pre-calculate the maximum projection distance
 	const float MaxProjectionDist = FMath::Abs(FVector::DotProduct(MapExtents, TeamAxis));
 	const bool bHasValidProjection = MaxProjectionDist > 1.0f;
-	const bool bHasValidHeight = MapSize.Z > 100.f; // Still useful for HeightScore
+	const bool bHasValidHeight = MapSize.Z > 100.f;
 
 	// 4. Score all spawn points 
 	for (FSpawnPointData& SpawnData : AllSpawnPoints)
@@ -1417,7 +1466,6 @@ void AUTeamArenaGame::ScoreAllSpawnPoints()
 		const FVector& Location = SpawnData.PlayerStart->GetActorLocation();
 
 		// --- Calculate Height Score (Z-Relative) --- 
-		// We keep this because "High Ground" is a quality metric, even if not a team metric.
 		SpawnData.HeightScore = bHasValidHeight
 			? ((Location.Z - MapMin.Z) / MapSize.Z)
 			: 0.5f;
@@ -1537,15 +1585,14 @@ void AUTeamArenaGame::FindMaxDistanceSpawnPair(const TArray<FSpawnPointData*>& C
 		return;
 	}
 
-	// Weights (kept your randomization logic)
-	float RandomVariation = 0.1f;
-	float CurrentDistanceWeight = SpawnDistanceWeight + FMath::FRandRange(-RandomVariation, RandomVariation);
-	float CurrentHeightWeight = SpawnHeightWeight + FMath::FRandRange(-RandomVariation, RandomVariation);
-	float CurrentUsageWeight = SpawnUsageWeight + FMath::FRandRange(-RandomVariation, RandomVariation);
-	float CurrentSeparationWeight = SpawnSeparationWeight + FMath::FRandRange(-RandomVariation, RandomVariation);
+	// --- Use strict deterministic weights ---
+	// Remove FMath::FRandRange calls. Use the raw values set in constructor.
+	float CurrentDistanceWeight = SpawnDistanceWeight;
+	float CurrentHeightWeight = SpawnHeightWeight;
+	float CurrentUsageWeight = SpawnUsageWeight;
+	float CurrentSeparationWeight = SpawnSeparationWeight;
 
 	float TotalWeight = CurrentDistanceWeight + CurrentHeightWeight + CurrentUsageWeight + CurrentSeparationWeight;
-	// Prevent divide by zero if weights are 0
 	if (TotalWeight > KINDA_SMALL_NUMBER)
 	{
 		CurrentDistanceWeight /= TotalWeight;
@@ -1553,6 +1600,7 @@ void AUTeamArenaGame::FindMaxDistanceSpawnPair(const TArray<FSpawnPointData*>& C
 		CurrentUsageWeight /= TotalWeight;
 		CurrentSeparationWeight /= TotalWeight;
 	}
+	// --- FIX END ---
 
 	struct FSpawnPairScore
 	{
@@ -2246,9 +2294,9 @@ void AUTeamArenaGame::CheckLastManStanding(int32 Alive0, int32 Alive1)
 		BroadcastLastManStanding(0, ClutchPlayer);
 		bTeam0LastManAnnounced = true;
 		// NEW: Track dark horse potential - Team0 player is now 1 vs Alive1 enemies
-		if (ClutchPlayer && Alive1 >= 2)
+		if (ClutchPlayer && Alive1 >= 3)
 		{
-			// This player is now in a 1v2+ situation - mark them as a dark horse candidate
+			// This player is now in a 1v3+ situation - mark them as a dark horse candidate
 			if (!DarkHorseCandidates.Contains(ClutchPlayer))
 			{
 				DarkHorseCandidates.Add(ClutchPlayer, Alive1); // Store how many enemies they're facing
@@ -2268,9 +2316,9 @@ void AUTeamArenaGame::CheckLastManStanding(int32 Alive0, int32 Alive1)
 		BroadcastLastManStanding(1, ClutchPlayer);
 		bTeam1LastManAnnounced = true;
 		// NEW: Track dark horse potential - Team1 player is now 1 vs Alive0 enemies
-		if (ClutchPlayer && Alive0 >= 2)
+		if (ClutchPlayer && Alive0 >= 3)
 		{
-			// This player is now in a 1v2+ situation - mark them as a dark horse candidate
+			// This player is now in a 1v3+ situation - mark them as a dark horse candidate
 			if (!DarkHorseCandidates.Contains(ClutchPlayer))
 			{
 				DarkHorseCandidates.Add(ClutchPlayer, Alive0); // Store how many enemies they're facing
@@ -2907,6 +2955,26 @@ void AUTeamArenaGame::BP_RestartCurrentRound()
 
 void AUTeamArenaGame::Logout(AController* Exiting)
 {
+	if (bCompetitiveAutoPause && IsMatchInProgress() && !HasMatchEnded() && !GetWorld()->IsPaused())
+	{
+		if (Exiting)
+		{
+			AUTPlayerState* ExitingPS = Cast<AUTPlayerState>(Exiting->PlayerState);
+
+			// Only pause for actual human players (ignore bots and spectators)
+			if (ExitingPS && !ExitingPS->bIsABot && !ExitingPS->bOnlySpectator)
+			{
+				UE_LOG(LogGameMode, Warning, TEXT("Competitive Auto-Pause: Player %s disconnected. Pausing match."), *ExitingPS->PlayerName);
+
+				// Passing nullptr to SetPause acts as a "System/Admin" pause
+				SetPause(nullptr);
+
+				// Optional: Broadcast a message to chat so players know why it paused
+				// BroadcastLocalized(this, UUTGameMessage::StaticClass(), 0, nullptr, nullptr, nullptr); 
+			}
+		}
+	}
+	
 	if (Exiting)
 	{
 		AUTPlayerState* PS = Cast<AUTPlayerState>(Exiting->PlayerState);
@@ -2932,7 +3000,7 @@ void AUTeamArenaGame::InitGameState()
 {
 	Super::InitGameState();
 
-	// CRITICAL FIX: Only change GameModeClass on clients for compatibility
+	// CRITICAL FIX : Only change GameModeClass on clients for compatibility
 	// Server needs to keep the real C++ class, but clients without the plugin
 	// need a fallback class they can load
 	
@@ -2943,8 +3011,101 @@ void AUTeamArenaGame::InitGameState()
 
 		UE_LOG(LogGameMode, Warning, TEXT("InitGameState: - Set GameModeClass to UTTeamGameMode for compatibility"));
 	}
-	
+
 }
+
+// 4. Timer Management
+void AUTeamArenaGame::StartCampCheckTimer()
+{
+	if (bEnableAntiCamp && CampCheckInterval > 0.0f)
+	{
+		GetWorldTimerManager().SetTimer(TimerHandle_CampCheck, this, &AUTeamArenaGame::CheckForCampers, CampCheckInterval, true);
+	}
+}
+
+void AUTeamArenaGame::StopCampCheckTimer()
+{
+	GetWorldTimerManager().ClearTimer(TimerHandle_CampCheck);
+}
+
+// 5. The Core Logic
+void AUTeamArenaGame::CheckForCampers()
+{
+	if (!bRoundInProgress || bWarmupMode) return;
+
+	for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
+	{
+		AUTPlayerController* PC = Cast<AUTPlayerController>(It->Get());
+		if (!PC) continue;
+
+		AUTPlayerState* PS = Cast<AUTPlayerState>(PC->PlayerState);
+		if (!PS || PS->bOnlySpectator || PS->bOutOfLives) continue;
+
+		APawn* Pawn = PC->GetPawn();
+		if (!Pawn || Pawn->IsPendingKill()) continue;
+
+		// Get or Create entry in the map
+		FCamperData& Data = CamperTracker.FindOrAdd(PS);
+
+		// Update Circular Buffer
+		Data.LocationHistory[Data.NextSlot] = Pawn->GetActorLocation();
+		Data.NextSlot++;
+
+		if (Data.NextSlot >= 10)
+		{
+			Data.NextSlot = 0;
+			Data.bHasFullHistory = true;
+		}
+
+		// Only calculate if we have enough samples (Warmed Up)
+		if (Data.bHasFullHistory)
+		{
+			// Calculate Bounding Box of history
+			FBox HistoryBox(ForceInit);
+			for (int32 i = 0; i < 10; i++)
+			{
+				HistoryBox += Data.LocationHistory[i];
+			}
+
+			// Get Max Dimension (Extent is half-size, so multiply by 2 for full width/height)
+			FVector Size = HistoryBox.GetSize();
+			float MaxDim = FMath::Max3(Size.X, Size.Y, Size.Z);
+
+			// Check vs Threshold
+			if (MaxDim < CampThreshold)
+			{
+				// Is it time to punish/warn again?
+				float TimeSinceLast = GetWorld()->GetTimeSeconds() - Data.LastPunishTime;
+
+				if (TimeSinceLast > CampWarnCooldown)
+				{
+					Data.ConsecutiveCampCount++;
+					Data.bWarned = true;
+					Data.LastPunishTime = GetWorld()->GetTimeSeconds();
+
+					// TRIGGER BLUEPRINT EVENT
+					BP_OnCamperDetected(PS, Data.ConsecutiveCampCount);
+
+					UE_LOG(LogGameMode, Log, TEXT("Camper Detected: %s (Dim: %.2f, Count: %d)"), *PS->PlayerName, MaxDim, Data.ConsecutiveCampCount);
+				}
+			}
+			else
+			{
+				// Player is moving enough
+				if (Data.bWarned || Data.ConsecutiveCampCount > 0)
+				{
+					Data.bWarned = false;
+					Data.ConsecutiveCampCount = 0;
+
+					// TRIGGER CLEAR EVENT
+					BP_OnCamperClear(PS);
+				}
+			}
+		}
+	}
+}
+
+
 
 
 #pragma endregion
