@@ -76,6 +76,7 @@ AUTeamArenaGame::AUTeamArenaGame(const FObjectInitializer& ObjectInitializer)
 	bTeam1LastManAnnounced = false;
 	Team0RoundDamage = 0;
 	Team1RoundDamage = 0;
+	bCompetitiveAutoPause = false;
 
 	// Initialize score tracking for domination/lead detection
 	PreviousRedScore = 0;
@@ -623,6 +624,11 @@ void AUTeamArenaGame::StartNextRound()
 	}
 
 	// Reset per-round trackers
+	// Clear old camper data
+	CamperTracker.Empty();
+
+	// Start the check timer
+	StartCampCheckTimer();
 	RoundWinningKiller = nullptr;
 	RoundWinningKillTime = 0.0f;
 	bPendingDarkHorseReplay = false;
@@ -759,6 +765,7 @@ void AUTeamArenaGame::EndRoundForTeam(int32 WinnerTeamIndex, FName Reason)
 	}
 
 	// Stop the round *immediately*
+	StopCampCheckTimer();
 	bRoundInProgress = false;
 	RoundEndTimeSeconds = 0.f;
 	LastRoundWinningTeamIndex = WinnerTeamIndex;
@@ -2948,6 +2955,26 @@ void AUTeamArenaGame::BP_RestartCurrentRound()
 
 void AUTeamArenaGame::Logout(AController* Exiting)
 {
+	if (bCompetitiveAutoPause && IsMatchInProgress() && !HasMatchEnded() && !GetWorld()->IsPaused())
+	{
+		if (Exiting)
+		{
+			AUTPlayerState* ExitingPS = Cast<AUTPlayerState>(Exiting->PlayerState);
+
+			// Only pause for actual human players (ignore bots and spectators)
+			if (ExitingPS && !ExitingPS->bIsABot && !ExitingPS->bOnlySpectator)
+			{
+				UE_LOG(LogGameMode, Warning, TEXT("Competitive Auto-Pause: Player %s disconnected. Pausing match."), *ExitingPS->PlayerName);
+
+				// Passing nullptr to SetPause acts as a "System/Admin" pause
+				SetPause(nullptr);
+
+				// Optional: Broadcast a message to chat so players know why it paused
+				// BroadcastLocalized(this, UUTGameMessage::StaticClass(), 0, nullptr, nullptr, nullptr); 
+			}
+		}
+	}
+	
 	if (Exiting)
 	{
 		AUTPlayerState* PS = Cast<AUTPlayerState>(Exiting->PlayerState);
@@ -2986,6 +3013,99 @@ void AUTeamArenaGame::InitGameState()
 	}
 
 }
+
+// 4. Timer Management
+void AUTeamArenaGame::StartCampCheckTimer()
+{
+	if (bEnableAntiCamp && CampCheckInterval > 0.0f)
+	{
+		GetWorldTimerManager().SetTimer(TimerHandle_CampCheck, this, &AUTeamArenaGame::CheckForCampers, CampCheckInterval, true);
+	}
+}
+
+void AUTeamArenaGame::StopCampCheckTimer()
+{
+	GetWorldTimerManager().ClearTimer(TimerHandle_CampCheck);
+}
+
+// 5. The Core Logic
+void AUTeamArenaGame::CheckForCampers()
+{
+	if (!bRoundInProgress || bWarmupMode) return;
+
+	for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
+	{
+		AUTPlayerController* PC = Cast<AUTPlayerController>(It->Get());
+		if (!PC) continue;
+
+		AUTPlayerState* PS = Cast<AUTPlayerState>(PC->PlayerState);
+		if (!PS || PS->bOnlySpectator || PS->bOutOfLives) continue;
+
+		APawn* Pawn = PC->GetPawn();
+		if (!Pawn || Pawn->IsPendingKill()) continue;
+
+		// Get or Create entry in the map
+		FCamperData& Data = CamperTracker.FindOrAdd(PS);
+
+		// Update Circular Buffer
+		Data.LocationHistory[Data.NextSlot] = Pawn->GetActorLocation();
+		Data.NextSlot++;
+
+		if (Data.NextSlot >= 10)
+		{
+			Data.NextSlot = 0;
+			Data.bHasFullHistory = true;
+		}
+
+		// Only calculate if we have enough samples (Warmed Up)
+		if (Data.bHasFullHistory)
+		{
+			// Calculate Bounding Box of history
+			FBox HistoryBox(ForceInit);
+			for (int32 i = 0; i < 10; i++)
+			{
+				HistoryBox += Data.LocationHistory[i];
+			}
+
+			// Get Max Dimension (Extent is half-size, so multiply by 2 for full width/height)
+			FVector Size = HistoryBox.GetSize();
+			float MaxDim = FMath::Max3(Size.X, Size.Y, Size.Z);
+
+			// Check vs Threshold
+			if (MaxDim < CampThreshold)
+			{
+				// Is it time to punish/warn again?
+				float TimeSinceLast = GetWorld()->GetTimeSeconds() - Data.LastPunishTime;
+
+				if (TimeSinceLast > CampWarnCooldown)
+				{
+					Data.ConsecutiveCampCount++;
+					Data.bWarned = true;
+					Data.LastPunishTime = GetWorld()->GetTimeSeconds();
+
+					// TRIGGER BLUEPRINT EVENT
+					BP_OnCamperDetected(PS, Data.ConsecutiveCampCount);
+
+					UE_LOG(LogGameMode, Log, TEXT("Camper Detected: %s (Dim: %.2f, Count: %d)"), *PS->PlayerName, MaxDim, Data.ConsecutiveCampCount);
+				}
+			}
+			else
+			{
+				// Player is moving enough
+				if (Data.bWarned || Data.ConsecutiveCampCount > 0)
+				{
+					Data.bWarned = false;
+					Data.ConsecutiveCampCount = 0;
+
+					// TRIGGER CLEAR EVENT
+					BP_OnCamperClear(PS);
+				}
+			}
+		}
+	}
+}
+
+
 
 
 #pragma endregion
