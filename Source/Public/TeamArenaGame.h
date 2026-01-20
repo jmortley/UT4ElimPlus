@@ -619,6 +619,12 @@ protected:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Arena|Spawning", meta = (ClampMin = "500.0", ClampMax = "5000.0"))
 	float MinimumEnemySpawnDistance;
 
+
+    // Minimum horizontal distance required from enemy. 
+    // Defaults to something high like 3000.0f to force cross-map spawns.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spawning")
+	float MinimumEnemyHorizontalDistance = 3000.0f;
+
 	/** Preferred distance between team spawns and enemy spawns (used for scoring) */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Arena|Spawning", meta = (ClampMin = "1000.0", ClampMax = "10000.0"))
 	float PreferredEnemySpawnDistance;

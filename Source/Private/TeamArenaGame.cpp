@@ -106,6 +106,7 @@ AUTeamArenaGame::AUTeamArenaGame(const FObjectInitializer& ObjectInitializer)
 	SpawnUsageWeight = 0.10f;
 	SpawnSeparationWeight = 0.15f;
 	MinimumEnemySpawnDistance = 2800.0f; // Minimum distance from enemy spawns
+	MinimumEnemyHorizontalDistance = 3000.0f;
 
 }
 
@@ -1570,7 +1571,7 @@ void AUTeamArenaGame::SelectOptimalSpawnPairForTeam(int32 TeamIndex)
 }
 
 
-
+/*
 void AUTeamArenaGame::FindMaxDistanceSpawnPair(const TArray<FSpawnPointData*>& CandidateSpawns, const TArray<APlayerStart*>& EnemySpawns, APlayerStart*& OutPrimary, APlayerStart*& OutSecondary)
 {
 	OutPrimary = nullptr;
@@ -1684,6 +1685,126 @@ void AUTeamArenaGame::FindMaxDistanceSpawnPair(const TArray<FSpawnPointData*>& C
 		// Assign purely based on the pair logic
 		OutPrimary = Spawn1;
 		OutSecondary = Spawn2;
+	}
+}
+*/
+
+
+
+void AUTeamArenaGame::FindMaxDistanceSpawnPair(const TArray<FSpawnPointData*>& CandidateSpawns, const TArray<APlayerStart*>& EnemySpawns, APlayerStart*& OutPrimary, APlayerStart*& OutSecondary)
+{
+	OutPrimary = nullptr;
+	OutSecondary = nullptr;
+
+	if (CandidateSpawns.Num() < 2)
+	{
+		if (CandidateSpawns.Num() == 1) OutPrimary = CandidateSpawns[0]->PlayerStart;
+		return;
+	}
+
+	// --- SETUP WEIGHTS ---
+	float CurrentDistanceWeight = SpawnDistanceWeight;
+	float CurrentHeightWeight = SpawnHeightWeight;
+	float CurrentUsageWeight = SpawnUsageWeight;
+	float CurrentSeparationWeight = SpawnSeparationWeight;
+
+	float TotalWeight = CurrentDistanceWeight + CurrentHeightWeight + CurrentUsageWeight + CurrentSeparationWeight;
+	if (TotalWeight > KINDA_SMALL_NUMBER)
+	{
+		CurrentDistanceWeight /= TotalWeight;
+		CurrentHeightWeight /= TotalWeight;
+		CurrentUsageWeight /= TotalWeight;
+		CurrentSeparationWeight /= TotalWeight;
+	}
+
+	struct FSpawnPairScore
+	{
+		float Score;
+		int32 Index1;
+		int32 Index2;
+		FSpawnPairScore(float InScore, int32 InIndex1, int32 InIndex2) : Score(InScore), Index1(InIndex1), Index2(InIndex2) {}
+	};
+
+	TArray<FSpawnPairScore> ScoredPairs;
+	ScoredPairs.Reserve(CandidateSpawns.Num() * 2);
+
+	for (int32 i = 0; i < CandidateSpawns.Num(); ++i)
+	{
+		for (int32 j = i + 1; j < CandidateSpawns.Num(); ++j)
+		{
+			APlayerStart* Spawn1 = CandidateSpawns[i]->PlayerStart;
+			APlayerStart* Spawn2 = CandidateSpawns[j]->PlayerStart;
+			if (!Spawn1 || !Spawn2) continue;
+
+			// 1. Enemy Distance Score
+			float MinDist1 = CalculateMinDistanceToEnemySpawns(Spawn1, EnemySpawns);
+			float MinDist2 = CalculateMinDistanceToEnemySpawns(Spawn2, EnemySpawns);
+
+			// 2. Vertical Stacking Check (The Bio/Mini Fix)
+			float MinHorizontalDist1 = 100000.0f;
+			float MinHorizontalDist2 = 100000.0f;
+
+			if (EnemySpawns.Num() > 0)
+			{
+				for (APlayerStart* EnemySpawn : EnemySpawns)
+				{
+					if (!EnemySpawn) continue;
+					float Dist2D_1 = (Spawn1->GetActorLocation() - EnemySpawn->GetActorLocation()).Size2D();
+					float Dist2D_2 = (Spawn2->GetActorLocation() - EnemySpawn->GetActorLocation()).Size2D();
+
+					MinHorizontalDist1 = FMath::Min(MinHorizontalDist1, Dist2D_1);
+					MinHorizontalDist2 = FMath::Min(MinHorizontalDist2, Dist2D_2);
+				}
+			}
+
+			float HeightScore1 = CandidateSpawns[i]->HeightScore;
+			float HeightScore2 = CandidateSpawns[j]->HeightScore;
+
+			float UsageScore1 = 1.0f / (1.0f + CandidateSpawns[i]->GetUsageCountForTeam(0) + CandidateSpawns[i]->GetUsageCountForTeam(1));
+			float UsageScore2 = 1.0f / (1.0f + CandidateSpawns[j]->GetUsageCountForTeam(0) + CandidateSpawns[j]->GetUsageCountForTeam(1));
+
+			// --- THIS IS THE CHANGE YOU WANTED ---
+			// Teammate Separation Score
+			float SpawnSeparation = FVector::Dist(Spawn1->GetActorLocation(), Spawn2->GetActorLocation());
+
+			// Changed divisor to 700.0f. 
+			// This means if teammates are 700 units apart, they get MAX score. 
+			// They don't need to be cross-map (1500+) anymore.
+			float SeparationScore = FMath::Min(SpawnSeparation / 700.0f, 1.0f);
+
+			float CombinedScore = (MinDist1 + MinDist2) * CurrentDistanceWeight +
+				(HeightScore1 + HeightScore2) * CurrentHeightWeight +
+				(UsageScore1 + UsageScore2) * CurrentUsageWeight +
+				SeparationScore * CurrentSeparationWeight;
+
+			// 3. Apply Penalties
+			if (EnemySpawns.Num() > 0)
+			{
+				// Penalize Vertical Stacking (Bio vs Mini)
+				if (MinHorizontalDist1 < MinimumEnemyHorizontalDistance || MinHorizontalDist2 < MinimumEnemyHorizontalDistance)
+				{
+					CombinedScore -= 50000.0f;
+				}
+
+				// Penalize 3D Proximity
+				if (MinDist1 < MinimumEnemySpawnDistance || MinDist2 < MinimumEnemySpawnDistance)
+				{
+					CombinedScore -= 10000.0f;
+				}
+			}
+
+			CombinedScore += FMath::FRandRange(-0.01f, 0.01f);
+			ScoredPairs.Add(FSpawnPairScore(CombinedScore, i, j));
+		}
+	}
+
+	if (ScoredPairs.Num() > 0)
+	{
+		ScoredPairs.Sort([](const FSpawnPairScore& A, const FSpawnPairScore& B) { return A.Score > B.Score; });
+		const FSpawnPairScore& SelectedPair = ScoredPairs[0];
+
+		OutPrimary = CandidateSpawns[SelectedPair.Index1]->PlayerStart;
+		OutSecondary = CandidateSpawns[SelectedPair.Index2]->PlayerStart;
 	}
 }
 
@@ -2920,30 +3041,19 @@ void AUTeamArenaGame::BP_RestartCurrentRound()
 	// Reset spawn selection for the new round attempt
 	ResetSpawnSelectionForNewRound();
 
-	// Draft Phase 1 (Initial Setup)
-
+	// Phase 1: Initial + immediate correction
 	SelectOptimalSpawnPairForTeam(0);
-
 	SelectOptimalSpawnPairForTeam(1);
+	SelectOptimalSpawnPairForTeam(0);  // T0 reacts to T1
+	SelectOptimalSpawnPairForTeam(1);  // T1 reacts to corrected T0
 
-	// Draft Phase 2 (Correction)
-
-	// Flip the "Last Mover" advantage every round so neither team can exploit it consistently.
-
+	// --- Phase 2: The "Advantage" ---
+	// If it's Team 0's turn to have the advantage, they get one final move 
+	// to counter Team 1's optimized position.
+	// (If it's Team 1's turn, we do nothing, because T1 *just moved* in the line above).
 	if (TotalRoundsPlayed % 2 == 0)
-
 	{
-
-		SelectOptimalSpawnPairForTeam(0); // Team 0 gets the final adjustment
-
-	}
-
-	else
-
-	{
-
-		SelectOptimalSpawnPairForTeam(1); // Team 1 gets the final adjustment
-
+		SelectOptimalSpawnPairForTeam(0);
 	}
 
 	// Start a brief intermission before the new round (3 seconds)
