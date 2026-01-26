@@ -609,7 +609,9 @@ protected:
 	void InitializeSpawnPointSystem();
 	void ScoreAllSpawnPoints();
 	void SelectOptimalSpawnPairForTeam(int32 TeamIndex);
-	void FindMaxDistanceSpawnPair(const TArray<FSpawnPointData*>& CandidateSpawns, const TArray<APlayerStart*>& EnemySpawns, APlayerStart*& OutPrimary, APlayerStart*& OutSecondary);
+	void FindMaxDistanceSpawnPair(const TArray<FSpawnPointData*>& CandidateSpawns, const TArray<APlayerStart*>& EnemySpawns, int32 TeamIndex, APlayerStart*& OutPrimary, APlayerStart*& OutSecondary);
+	bool IsSpawnOnHomeSide(const FSpawnPointData& SpawnData, int32 TeamIndex) const;
+	//void FindMaxDistanceSpawnPair(const TArray<FSpawnPointData*>& CandidateSpawns, const TArray<APlayerStart*>& EnemySpawns, APlayerStart*& OutPrimary, APlayerStart*& OutSecondary);
 	float CalculateMinDistanceToEnemySpawns(APlayerStart* SpawnPoint, const TArray<APlayerStart*>& EnemySpawns);
 	TArray<FSpawnPointData*> GetSpawnCandidatesForTeam(int32 TeamIndex);
 	FVector FindSafeSpawnOffset(APlayerStart* BaseSpawn, int32 AttemptIndex);

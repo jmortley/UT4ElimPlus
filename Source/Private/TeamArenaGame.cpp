@@ -200,7 +200,10 @@ void AUTeamArenaGame::DelayedEndGame(int32 WinnerTeamIndex, FName Reason)
 
 void AUTeamArenaGame::HandleMatchHasStarted()
 {
-
+	UE_LOG(LogGameMode, Warning, TEXT("=== TeamArena::HandleMatchHasStarted ENTER ==="));
+	UE_LOG(LogGameMode, Warning, TEXT("  UTIsHandlingReplays: %s"), UTIsHandlingReplays() ? TEXT("TRUE") : TEXT("FALSE"));
+	UE_LOG(LogGameMode, Warning, TEXT("  GetGameInstance: %s"), GetGameInstance() ? TEXT("VALID") : TEXT("NULL"));
+	UE_LOG(LogGameMode, Warning, TEXT("  GetNetMode: %d"), (int32)GetNetMode());
 	Super::HandleMatchHasStarted();
 
 	bWarmupMode = false;
@@ -231,6 +234,10 @@ void AUTeamArenaGame::CallMatchStateChangeNotify()
 	else if (GetMatchState() == MatchState::InProgress)// && GetWorld()->bMatchStarted)
 	{
 		// We are transitioning *to* InProgress, so start the new round
+		if (TotalRoundsPlayed == 0)
+		{
+			Super::CallMatchStateChangeNotify();  // This triggers HandleMatchHasStarted
+		}
 		bWarmupMode = false;
 		StartNextRound();
 	}
@@ -1485,11 +1492,15 @@ void AUTeamArenaGame::ScoreAllSpawnPoints()
 	}
 }
 
+
+
+
 void AUTeamArenaGame::SelectOptimalSpawnPairForTeam(int32 TeamIndex)
 {
 	TArray<APlayerStart*>& SelectedSpawns = (TeamIndex == 0) ? Team0SelectedSpawns : Team1SelectedSpawns;
 	const TArray<APlayerStart*>& EnemySpawns = (TeamIndex == 0) ? Team1SelectedSpawns : Team0SelectedSpawns;
 	SelectedSpawns.Empty();
+
 	TArray<FSpawnPointData*> Candidates = GetSpawnCandidatesForTeam(TeamIndex);
 	if (Candidates.Num() < 2)
 	{
@@ -1504,42 +1515,22 @@ void AUTeamArenaGame::SelectOptimalSpawnPairForTeam(int32 TeamIndex)
 		}
 		return;
 	}
-	// NEW: Add randomization to prevent always picking the same pairs
+
 	// Shuffle candidates to introduce variety
-		for (int32 i = Candidates.Num() - 1; i > 0; i--)
-		{
+	for (int32 i = Candidates.Num() - 1; i > 0; i--)
+	{
 		int32 j = FMath::RandRange(0, i);
-			if (i != j)
-			{
-				Candidates.Swap(i, j);
-			}
+		if (i != j)
+		{
+			Candidates.Swap(i, j);
 		}
+	}
+
 	APlayerStart* PrimarySpawn = nullptr;
 	APlayerStart* SecondarySpawn = nullptr;
 
-	/* NEW: Use multiple selection strategies and rotate between them
-	int32 SelectionStrategy = CurrentRoundNumber % 3; // Rotate between 2 strategies
+	FindMaxDistanceSpawnPair(Candidates, EnemySpawns, TeamIndex,PrimarySpawn, SecondarySpawn);
 
-	switch (SelectionStrategy)
-	{
-	case 0: // Distance-focused selection
-		FindMaxDistanceSpawnPair(Candidates, EnemySpawns, PrimarySpawn, SecondarySpawn);
-		break;
-
-	case 1: // MODIFIED: This now calls BalancedRandom instead of LeastUsed
-		FindBalancedRandomSpawnPair(Candidates, EnemySpawns, TeamIndex, PrimarySpawn, SecondarySpawn);
-		break;
-
-	case 2: // Distance-focused selection
-		FindMaxDistanceSpawnPair(Candidates, EnemySpawns, PrimarySpawn, SecondarySpawn);
-		break;
-		
-	}
-	*/
-
-
-
-	FindMaxDistanceSpawnPair(Candidates, EnemySpawns, PrimarySpawn, SecondarySpawn);
 	if (PrimarySpawn)
 	{
 		SelectedSpawns.Add(PrimarySpawn);
@@ -1552,6 +1543,9 @@ void AUTeamArenaGame::SelectOptimalSpawnPairForTeam(int32 TeamIndex)
 			}
 		}
 	}
+
+	// IMPORTANT: Check if SecondarySpawn is valid before adding it
+	// The fallback logic may return nullptr here to force a stack spawn.
 	if (SecondarySpawn)
 	{
 		SelectedSpawns.Add(SecondarySpawn);
@@ -1564,10 +1558,11 @@ void AUTeamArenaGame::SelectOptimalSpawnPairForTeam(int32 TeamIndex)
 			}
 		}
 	}
+
 	UE_LOG(LogGameMode, Log, TEXT("SelectOptimalSpawnPairForTeam: Team %d selected %s and %s"),
 		TeamIndex,
 		PrimarySpawn ? *PrimarySpawn->GetName() : TEXT("None"),
-		SecondarySpawn ? *SecondarySpawn->GetName() : TEXT("None"));
+		SecondarySpawn ? *SecondarySpawn->GetName() : TEXT("None (Fallback/Stack)"));
 }
 
 
@@ -1583,122 +1578,6 @@ void AUTeamArenaGame::FindMaxDistanceSpawnPair(const TArray<FSpawnPointData*>& C
 		{
 			OutPrimary = CandidateSpawns[0]->PlayerStart;
 		}
-		return;
-	}
-
-	// --- Use strict deterministic weights ---
-	// Remove FMath::FRandRange calls. Use the raw values set in constructor.
-	float CurrentDistanceWeight = SpawnDistanceWeight;
-	float CurrentHeightWeight = SpawnHeightWeight;
-	float CurrentUsageWeight = SpawnUsageWeight;
-	float CurrentSeparationWeight = SpawnSeparationWeight;
-
-	float TotalWeight = CurrentDistanceWeight + CurrentHeightWeight + CurrentUsageWeight + CurrentSeparationWeight;
-	if (TotalWeight > KINDA_SMALL_NUMBER)
-	{
-		CurrentDistanceWeight /= TotalWeight;
-		CurrentHeightWeight /= TotalWeight;
-		CurrentUsageWeight /= TotalWeight;
-		CurrentSeparationWeight /= TotalWeight;
-	}
-	// --- FIX END ---
-
-	struct FSpawnPairScore
-	{
-		float Score;
-		int32 Index1;
-		int32 Index2;
-		FSpawnPairScore(float InScore, int32 InIndex1, int32 InIndex2) : Score(InScore), Index1(InIndex1), Index2(InIndex2) {}
-	};
-
-	TArray<FSpawnPairScore> ScoredPairs;
-
-	// SAFETY: Pre-calculate capacity to avoid reallocations
-	ScoredPairs.Reserve(CandidateSpawns.Num() * 2);
-
-	for (int32 i = 0; i < CandidateSpawns.Num(); ++i)
-	{
-		for (int32 j = i + 1; j < CandidateSpawns.Num(); ++j)
-		{
-			APlayerStart* Spawn1 = CandidateSpawns[i]->PlayerStart;
-			APlayerStart* Spawn2 = CandidateSpawns[j]->PlayerStart;
-			if (!Spawn1 || !Spawn2) continue;
-
-			float MinDist1 = CalculateMinDistanceToEnemySpawns(Spawn1, EnemySpawns);
-			float MinDist2 = CalculateMinDistanceToEnemySpawns(Spawn2, EnemySpawns);
-
-			float HeightScore1 = CandidateSpawns[i]->HeightScore;
-			float HeightScore2 = CandidateSpawns[j]->HeightScore;
-
-			// Usage score: Prefer lower usage
-			float UsageScore1 = 1.0f / (1.0f + CandidateSpawns[i]->GetUsageCountForTeam(0) + CandidateSpawns[i]->GetUsageCountForTeam(1));
-			float UsageScore2 = 1.0f / (1.0f + CandidateSpawns[j]->GetUsageCountForTeam(0) + CandidateSpawns[j]->GetUsageCountForTeam(1));
-
-			float SpawnSeparation = FVector::Dist(Spawn1->GetActorLocation(), Spawn2->GetActorLocation());
-			float SeparationScore = FMath::Min(SpawnSeparation / 1000.0f, 1.0f);
-
-			float CombinedScore = (MinDist1 + MinDist2) * CurrentDistanceWeight +
-				(HeightScore1 + HeightScore2) * CurrentHeightWeight +
-				(UsageScore1 + UsageScore2) * CurrentUsageWeight +
-				SeparationScore * CurrentSeparationWeight;
-
-			// --- GRACEFUL DEGRADATION LOGIC ---
-			// If enemy spawns exist, apply the threshold check.
-			if (EnemySpawns.Num() > 0)
-			{
-				if (MinDist1 < MinimumEnemySpawnDistance || MinDist2 < MinimumEnemySpawnDistance)
-				{
-					// Instead of 'continue', we apply a massive penalty (-10000).
-					// This ensures these pairs are at the bottom of the list.
-					// However, because we still added 'CombinedScore' above, 
-					// a pair at 2400 units will still score higher than a pair at 500 units within this "bad" group.
-					CombinedScore -= 10000.0f;
-				}
-			}
-			// ----------------------------------
-
-			CombinedScore += FMath::FRandRange(-0.01f, 0.01f); // Tie-breaker
-			ScoredPairs.Add(FSpawnPairScore(CombinedScore, i, j));
-		}
-	}
-
-	if (ScoredPairs.Num() > 0)
-	{
-		// Sort by score (descending)
-		ScoredPairs.Sort([](const FSpawnPairScore& A, const FSpawnPairScore& B) {
-			return A.Score > B.Score;
-			});
-
-		// We removed the randomization here because we want the absolute best result
-		// (The randomization is already applied via the Weights at the top)
-		const FSpawnPairScore& SelectedPair = ScoredPairs[0];
-
-		// DEBUG: Check if we were forced to use a sub-optimal spawn
-		if (SelectedPair.Score < -5000.0f)
-		{
-			UE_LOG(LogGameMode, Warning, TEXT("Spawn System: Could not find spawn > %f units. Using best available fallback."), MinimumEnemySpawnDistance);
-		}
-
-		APlayerStart* Spawn1 = CandidateSpawns[SelectedPair.Index1]->PlayerStart;
-		APlayerStart* Spawn2 = CandidateSpawns[SelectedPair.Index2]->PlayerStart;
-
-		// Assign purely based on the pair logic
-		OutPrimary = Spawn1;
-		OutSecondary = Spawn2;
-	}
-}
-*/
-
-
-
-void AUTeamArenaGame::FindMaxDistanceSpawnPair(const TArray<FSpawnPointData*>& CandidateSpawns, const TArray<APlayerStart*>& EnemySpawns, APlayerStart*& OutPrimary, APlayerStart*& OutSecondary)
-{
-	OutPrimary = nullptr;
-	OutSecondary = nullptr;
-
-	if (CandidateSpawns.Num() < 2)
-	{
-		if (CandidateSpawns.Num() == 1) OutPrimary = CandidateSpawns[0]->PlayerStart;
 		return;
 	}
 
@@ -1763,13 +1642,10 @@ void AUTeamArenaGame::FindMaxDistanceSpawnPair(const TArray<FSpawnPointData*>& C
 			float UsageScore1 = 1.0f / (1.0f + CandidateSpawns[i]->GetUsageCountForTeam(0) + CandidateSpawns[i]->GetUsageCountForTeam(1));
 			float UsageScore2 = 1.0f / (1.0f + CandidateSpawns[j]->GetUsageCountForTeam(0) + CandidateSpawns[j]->GetUsageCountForTeam(1));
 
-			// --- THIS IS THE CHANGE YOU WANTED ---
 			// Teammate Separation Score
 			float SpawnSeparation = FVector::Dist(Spawn1->GetActorLocation(), Spawn2->GetActorLocation());
 
-			// Changed divisor to 700.0f. 
-			// This means if teammates are 700 units apart, they get MAX score. 
-			// They don't need to be cross-map (1500+) anymore.
+			// If teammates are 700 units apart, they get MAX score. 
 			float SeparationScore = FMath::Min(SpawnSeparation / 700.0f, 1.0f);
 
 			float CombinedScore = (MinDist1 + MinDist2) * CurrentDistanceWeight +
@@ -1803,10 +1679,238 @@ void AUTeamArenaGame::FindMaxDistanceSpawnPair(const TArray<FSpawnPointData*>& C
 		ScoredPairs.Sort([](const FSpawnPairScore& A, const FSpawnPairScore& B) { return A.Score > B.Score; });
 		const FSpawnPairScore& SelectedPair = ScoredPairs[0];
 
+		// --- SAFETY FALLBACK CHECK ---
+		// If the best pair has a score < -5000, it means it triggered one of our heavy penalties 
+		// (Vertical Stacking or Proximity). We should NOT use it.
+		if (SelectedPair.Score < -5000.0f)
+		{
+			UE_LOG(LogGameMode, Warning, TEXT("Spawn System: CRITICAL - All spawn pairs failed safety checks (Score: %.2f). Engaging 1v1 Fallback."), SelectedPair.Score);
+
+			// Find the single absolute best point (furthest from enemies)
+			APlayerStart* BestFallback = nullptr;
+			float BestFallbackDist = -1.0f;
+
+			for (FSpawnPointData* Candidate : CandidateSpawns)
+			{
+				if (!Candidate || !Candidate->PlayerStart) continue;
+
+				float Dist = CalculateMinDistanceToEnemySpawns(Candidate->PlayerStart, EnemySpawns);
+				if (Dist > BestFallbackDist)
+				{
+					BestFallbackDist = Dist;
+					BestFallback = Candidate->PlayerStart;
+				}
+			}
+
+			if (BestFallback)
+			{
+				UE_LOG(LogGameMode, Warning, TEXT("  - Fallback Spawn Selected: %s (Distance: %.0f)"), *BestFallback->GetName(), BestFallbackDist);
+				OutPrimary = BestFallback;
+				OutSecondary = nullptr; // Force 1v1 logic
+				return;
+			}
+		}
+
+		// Normal assignment if the pair is valid
 		OutPrimary = CandidateSpawns[SelectedPair.Index1]->PlayerStart;
 		OutSecondary = CandidateSpawns[SelectedPair.Index2]->PlayerStart;
 	}
 }
+
+*/
+
+
+
+void AUTeamArenaGame::FindMaxDistanceSpawnPair(const TArray<FSpawnPointData*>& CandidateSpawns, const TArray<APlayerStart*>& EnemySpawns, int32 TeamIndex, APlayerStart*& OutPrimary, APlayerStart*& OutSecondary)
+{
+	OutPrimary = nullptr;
+	OutSecondary = nullptr;
+
+	if (CandidateSpawns.Num() < 2)
+	{
+		if (CandidateSpawns.Num() == 1)
+		{
+			OutPrimary = CandidateSpawns[0]->PlayerStart;
+		}
+		return;
+	}
+
+	// --- SETUP WEIGHTS ---
+	float CurrentDistanceWeight = SpawnDistanceWeight;
+	float CurrentHeightWeight = SpawnHeightWeight;
+	float CurrentUsageWeight = SpawnUsageWeight;
+	float CurrentSeparationWeight = SpawnSeparationWeight;
+
+	// Home-side bonus: prefer spawns on the team's designated side, but don't exclude others
+	const float HomeSideBonus = 500.0f;
+
+	float TotalWeight = CurrentDistanceWeight + CurrentHeightWeight + CurrentUsageWeight + CurrentSeparationWeight;
+	if (TotalWeight > KINDA_SMALL_NUMBER)
+	{
+		CurrentDistanceWeight /= TotalWeight;
+		CurrentHeightWeight /= TotalWeight;
+		CurrentUsageWeight /= TotalWeight;
+		CurrentSeparationWeight /= TotalWeight;
+	}
+
+	struct FSpawnPairScore
+	{
+		float Score;
+		int32 Index1;
+		int32 Index2;
+		FSpawnPairScore(float InScore, int32 InIndex1, int32 InIndex2) : Score(InScore), Index1(InIndex1), Index2(InIndex2) {}
+	};
+
+	TArray<FSpawnPairScore> ScoredPairs;
+	ScoredPairs.Reserve(CandidateSpawns.Num() * 2);
+
+	for (int32 i = 0; i < CandidateSpawns.Num(); ++i)
+	{
+		for (int32 j = i + 1; j < CandidateSpawns.Num(); ++j)
+		{
+			APlayerStart* Spawn1 = CandidateSpawns[i]->PlayerStart;
+			APlayerStart* Spawn2 = CandidateSpawns[j]->PlayerStart;
+			if (!Spawn1 || !Spawn2) continue;
+
+			// 1. Enemy Distance Score
+			float MinDist1 = CalculateMinDistanceToEnemySpawns(Spawn1, EnemySpawns);
+			float MinDist2 = CalculateMinDistanceToEnemySpawns(Spawn2, EnemySpawns);
+
+			// 2. Vertical Stacking Check (The Bio/Mini Fix)
+			float MinHorizontalDist1 = 100000.0f;
+			float MinHorizontalDist2 = 100000.0f;
+
+			if (EnemySpawns.Num() > 0)
+			{
+				for (APlayerStart* EnemySpawn : EnemySpawns)
+				{
+					if (!EnemySpawn) continue;
+					float Dist2D_1 = (Spawn1->GetActorLocation() - EnemySpawn->GetActorLocation()).Size2D();
+					float Dist2D_2 = (Spawn2->GetActorLocation() - EnemySpawn->GetActorLocation()).Size2D();
+
+					MinHorizontalDist1 = FMath::Min(MinHorizontalDist1, Dist2D_1);
+					MinHorizontalDist2 = FMath::Min(MinHorizontalDist2, Dist2D_2);
+				}
+			}
+
+			float HeightScore1 = CandidateSpawns[i]->HeightScore;
+			float HeightScore2 = CandidateSpawns[j]->HeightScore;
+
+			float UsageScore1 = 1.0f / (1.0f + CandidateSpawns[i]->GetUsageCountForTeam(0) + CandidateSpawns[i]->GetUsageCountForTeam(1));
+			float UsageScore2 = 1.0f / (1.0f + CandidateSpawns[j]->GetUsageCountForTeam(0) + CandidateSpawns[j]->GetUsageCountForTeam(1));
+
+			// Teammate Separation Score
+			float SpawnSeparation = FVector::Dist(Spawn1->GetActorLocation(), Spawn2->GetActorLocation());
+
+			// If teammates are 700 units apart, they get MAX score. 
+			float SeparationScore = FMath::Min(SpawnSeparation / 700.0f, 1.0f);
+
+			float CombinedScore = (MinDist1 + MinDist2) * CurrentDistanceWeight +
+				(HeightScore1 + HeightScore2) * CurrentHeightWeight +
+				(UsageScore1 + UsageScore2) * CurrentUsageWeight +
+				SeparationScore * CurrentSeparationWeight;
+
+			// 3. Apply Penalties
+			if (EnemySpawns.Num() > 0)
+			{
+				// Penalize Vertical Stacking (Bio vs Mini)
+				if (MinHorizontalDist1 < MinimumEnemyHorizontalDistance || MinHorizontalDist2 < MinimumEnemyHorizontalDistance)
+				{
+					CombinedScore -= 50000.0f;
+				}
+
+				// Penalize 3D Proximity
+				if (MinDist1 < MinimumEnemySpawnDistance || MinDist2 < MinimumEnemySpawnDistance)
+				{
+					CombinedScore -= 10000.0f;
+				}
+			}
+
+			// 4. Apply Home-Side Bonus (soft preference, not hard requirement)
+			// This encourages teams to spawn on their designated side when it's safe,
+			// but allows escaping to the other side when necessary
+			if (IsSpawnOnHomeSide(*CandidateSpawns[i], TeamIndex))
+			{
+				CombinedScore += HomeSideBonus;
+			}
+			if (IsSpawnOnHomeSide(*CandidateSpawns[j], TeamIndex))
+			{
+				CombinedScore += HomeSideBonus;
+			}
+
+			CombinedScore += FMath::FRandRange(-0.01f, 0.01f);
+			ScoredPairs.Add(FSpawnPairScore(CombinedScore, i, j));
+		}
+	}
+
+	if (ScoredPairs.Num() > 0)
+	{
+		ScoredPairs.Sort([](const FSpawnPairScore& A, const FSpawnPairScore& B) { return A.Score > B.Score; });
+		const FSpawnPairScore& SelectedPair = ScoredPairs[0];
+
+		// --- SAFETY FALLBACK CHECK ---
+		// If the best pair has a score < -5000, it means it triggered one of our heavy penalties 
+		// (Vertical Stacking or Proximity). We should NOT use it.
+		if (SelectedPair.Score < -5000.0f)
+		{
+			UE_LOG(LogGameMode, Warning, TEXT("Spawn System: CRITICAL - All spawn pairs failed safety checks (Score: %.2f). Searching ALL spawns for safe location."), SelectedPair.Score);
+
+			// Find the FURTHEST spawns from enemies - no threshold filtering here!
+			// The fallback is a last resort, so we just want maximum distance, period.
+			APlayerStart* BestFallback = nullptr;
+			APlayerStart* SecondBestFallback = nullptr;
+			float BestFallbackDist = -1.0f;
+			float SecondBestDist = -1.0f;
+
+			for (FSpawnPointData& SpawnData : AllSpawnPoints)
+			{
+				if (!SpawnData.PlayerStart) continue;
+
+				float Dist = CalculateMinDistanceToEnemySpawns(SpawnData.PlayerStart, EnemySpawns);
+
+				if (Dist > BestFallbackDist)
+				{
+					// Promote current best to second best
+					SecondBestFallback = BestFallback;
+					SecondBestDist = BestFallbackDist;
+					// New best
+					BestFallbackDist = Dist;
+					BestFallback = SpawnData.PlayerStart;
+				}
+				else if (Dist > SecondBestDist && SpawnData.PlayerStart != BestFallback)
+				{
+					SecondBestDist = Dist;
+					SecondBestFallback = SpawnData.PlayerStart;
+				}
+			}
+
+			if (BestFallback)
+			{
+				UE_LOG(LogGameMode, Warning, TEXT("  - Emergency Fallback Primary: %s (Distance: %.0f)"), *BestFallback->GetName(), BestFallbackDist);
+				OutPrimary = BestFallback;
+
+				// Give them a second spawn if reasonably far
+				if (SecondBestFallback && SecondBestDist > 1000.0f)
+				{
+					UE_LOG(LogGameMode, Warning, TEXT("  - Emergency Fallback Secondary: %s (Distance: %.0f)"), *SecondBestFallback->GetName(), SecondBestDist);
+					OutSecondary = SecondBestFallback;
+				}
+				else
+				{
+					UE_LOG(LogGameMode, Warning, TEXT("  - No safe secondary spawn, forcing stack spawn"));
+					OutSecondary = nullptr;
+				}
+				return;
+			}
+		}
+
+
+		// Normal assignment if the pair is valid
+		OutPrimary = CandidateSpawns[SelectedPair.Index1]->PlayerStart;
+		OutSecondary = CandidateSpawns[SelectedPair.Index2]->PlayerStart;
+	}
+}
+
 
 
 
@@ -1958,7 +2062,7 @@ FVector AUTeamArenaGame::FindSafeSpawnOffset(APlayerStart* BaseSpawn, int32 Atte
 	return TestLocation;
 }
 
-
+/*
 // IMPROVED: Add randomization to candidate selection
 TArray<FSpawnPointData*> AUTeamArenaGame::GetSpawnCandidatesForTeam(int32 TeamIndex)
 {
@@ -2024,8 +2128,54 @@ TArray<FSpawnPointData*> AUTeamArenaGame::GetSpawnCandidatesForTeam(int32 TeamIn
 
 	return Candidates;
 }
+*/
 
 
+// IMPROVED: Add randomization to candidate selection
+TArray<FSpawnPointData*> AUTeamArenaGame::GetSpawnCandidatesForTeam(int32 TeamIndex)
+{
+	TArray<FSpawnPointData*> Candidates;
+
+	// SOFT-FILTER: Include ALL spawns - safety (distance from enemies) will determine
+	// which spawns are viable. Home-side preference is applied as a BONUS in scoring,
+	// not as a hard filter that could trap a team near enemies.
+	for (FSpawnPointData& SpawnData : AllSpawnPoints)
+	{
+		if (!SpawnData.PlayerStart) continue;
+		Candidates.Add(&SpawnData);
+	}
+
+	// Shuffle to add variety when scores are similar
+	for (int32 i = Candidates.Num() - 1; i > 0; i--)
+	{
+		int32 j = FMath::RandRange(0, i);
+		if (i != j)
+		{
+			Candidates.Swap(i, j);
+		}
+	}
+
+	return Candidates;
+}
+
+// Helper function to check if a spawn is on the team's "home side" for this round
+bool AUTeamArenaGame::IsSpawnOnHomeSide(const FSpawnPointData& SpawnData, int32 TeamIndex) const
+{
+	bool bSwapSides = (CurrentRoundNumber % 2 == 1);
+
+	if (bSwapSides)
+	{
+		// ODD round: Team 0 is Positive, Team 1 is Negative
+		return (TeamIndex == 0 && SpawnData.TeamSideScore >= 0.0f) ||
+			(TeamIndex == 1 && SpawnData.TeamSideScore <= 0.0f);
+	}
+	else
+	{
+		// EVEN round: Team 0 is Negative, Team 1 is Positive
+		return (TeamIndex == 0 && SpawnData.TeamSideScore <= 0.0f) ||
+			(TeamIndex == 1 && SpawnData.TeamSideScore >= 0.0f);
+	}
+}
 
 
 bool AUTeamArenaGame::IsLocationClearOfPlayers(const FVector& Location, float CheckRadius)
