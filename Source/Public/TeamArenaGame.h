@@ -618,7 +618,7 @@ protected:
 	bool IsLocationClearOfPlayers(const FVector& Location, float CheckRadius = 150.0f);
 	void ResetSpawnSelectionForNewRound();
 	/** Minimum distance required between team spawns and enemy spawns */
-	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Arena|Spawning", meta = (ClampMin = "500.0", ClampMax = "5000.0"))
+	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Arena|Spawning", meta = (ClampMin = "500.0", ClampMax = "15000.0"))
 	float MinimumEnemySpawnDistance;
 
 
@@ -628,7 +628,7 @@ protected:
 	float MinimumEnemyHorizontalDistance = 3000.0f;
 
 	/** Preferred distance between team spawns and enemy spawns (used for scoring) */
-	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Arena|Spawning", meta = (ClampMin = "1000.0", ClampMax = "10000.0"))
+	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Arena|Spawning", meta = (ClampMin = "1000.0", ClampMax = "15000.0"))
 	float PreferredEnemySpawnDistance;
 	
 	UPROPERTY(Transient)
