@@ -80,6 +80,48 @@ struct FSpawnPointData
 	}
 };
 
+
+
+// A complete spawn layout for both teams in one struct.
+// Every entry in the precomputed list is GUARANTEED safe by construction.
+USTRUCT()
+struct FSpawnLayout
+{
+	GENERATED_BODY()
+
+	// Team 0 spawns (Secondary is nullptr for stack spawns)
+	UPROPERTY()
+	APlayerStart* T0_Primary;
+
+	UPROPERTY()
+	APlayerStart* T0_Secondary;
+
+	// Team 1 spawns (Secondary is nullptr for stack spawns)
+	UPROPERTY()
+	APlayerStart* T1_Primary;
+
+	UPROPERTY()
+	APlayerStart* T1_Secondary;
+
+	// Pre-graded quality metrics
+	float MinCrossDistance2D;   // Worst-case horizontal distance between any T0 and T1 spawn
+	float QualityScore;        // Overall quality of this layout
+	float T0Separation;        // Teammate spread for Team 0 (0 if stacked)
+	float T1Separation;        // Teammate spread for Team 1 (0 if stacked)
+	int32 UsageCount;          // How many times this layout has been picked this match
+
+	FSpawnLayout()
+		: T0_Primary(nullptr), T0_Secondary(nullptr)
+		, T1_Primary(nullptr), T1_Secondary(nullptr)
+		, MinCrossDistance2D(0.f), QualityScore(0.f)
+		, T0Separation(0.f), T1Separation(0.f)
+		, UsageCount(0)
+	{
+	}
+};
+
+
+
 USTRUCT()
 struct FCamperData
 {
@@ -143,6 +185,13 @@ public:
 	UPROPERTY(VisibleInstanceOnly, BlueprintReadOnly, Category = "Arena|State")
 	int32 LastRoundWinningTeamIndex;
 
+	bool ValidateSpawnLocation(const FVector& TestLocation);
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spawning")
+	float MinimumStackSpawnDistance2D = 5000.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spawning")
+	int32 ForceStackEveryNRounds = 3;
 	/** Total number of rounds played (including draws) - accessible from Blueprint */
 	UPROPERTY(VisibleInstanceOnly, BlueprintReadOnly, Category = "Arena|State")
 	int32 TotalRoundsPlayed;
@@ -153,6 +202,9 @@ public:
 	/** Restart the current round - useful for handling disconnections or other issues during official matches */
 	UFUNCTION(BlueprintCallable, Category = "TeamArena|Round Control")
 	void BP_RestartCurrentRound();
+
+	UFUNCTION(BlueprintCallable, Category = "TeamArena|Admin")
+	void BP_SetTeamScores(int32 RedScore, int32 BlueScore);
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spectating")
 	bool useBPSpecFunction;
@@ -322,6 +374,7 @@ public:
 	virtual void    RestartPlayer(AController* NewPlayer) override;
 	virtual void    ScoreKill_Implementation(AController* Killer, AController* Other, APawn* KilledPawn, TSubclassOf<UDamageType> DamageType) override;
 	virtual void	ScoreDamage_Implementation(int32 DamageAmount, AUTPlayerState* Victim, AUTPlayerState* Attacker) override;
+	virtual APawn* SpawnDefaultPawnFor_Implementation(AController* NewPlayer, AActor* StartSpot) override;
 
 	// -------- Victory Audio (Blueprint Editable) --------
 	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Arena|Victory Audio")
@@ -585,10 +638,10 @@ protected:
 	int32 CurrentRoundNumber = 0;
 
 	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Arena|Spawning")
-	float SpawnOffsetDistance = 100.0f;
+	float SpawnOffsetDistance = 90.0f;
 
 	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Arena|Spawning")
-	int32 MaxSpawnOffsetAttempts = 8;
+	int32 MaxSpawnOffsetAttempts = 4;
 
 	UPROPERTY(Transient)
 	bool bSpawnPointsInitialized = false;
@@ -615,12 +668,33 @@ protected:
 	float CalculateMinDistanceToEnemySpawns(APlayerStart* SpawnPoint, const TArray<APlayerStart*>& EnemySpawns);
 	TArray<FSpawnPointData*> GetSpawnCandidatesForTeam(int32 TeamIndex);
 	FVector FindSafeSpawnOffset(APlayerStart* BaseSpawn, int32 AttemptIndex);
-	bool IsLocationClearOfPlayers(const FVector& Location, float CheckRadius = 150.0f);
+	bool IsLocationClearOfPlayers(const FVector& Location, float CheckRadius = 85.0f);
 	void ResetSpawnSelectionForNewRound();
 	/** Minimum distance required between team spawns and enemy spawns */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Arena|Spawning", meta = (ClampMin = "500.0", ClampMax = "15000.0"))
 	float MinimumEnemySpawnDistance;
+	// Precomputed layout arrays (filled once at map load, never modified during gameplay)
+	TArray<FSpawnLayout> ValidLayouts_2v2;   // Both teams get split spawns
+	TArray<FSpawnLayout> ValidLayouts_1v1;   // Both teams stack on single spawn
 
+	// Tuning: maximum teammate separation to still count as a "pair"
+	// Beyond this, teammates are too far to help each other
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spawning")
+	float MaxTeammateSeparation2D = 2500.0f;
+
+	// Tuning: minimum teammate separation for split spawns
+	// Below this, they're basically stacked anyway - not worth splitting
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spawning")
+	float MinTeammateSeparation2D = 600.0f;
+
+	// Precomputation
+	void PrecomputeSpawnLayouts();
+
+	// Runtime selection (called at round start)
+	void SelectSpawnLayoutForRound();
+
+	// Helper
+	float GetMinCrossTeamDistance2D(const TArray<APlayerStart*>& TeamA, const TArray<APlayerStart*>& TeamB);
 
     // Minimum horizontal distance required from enemy. 
     // Defaults to something high like 3000.0f to force cross-map spawns.

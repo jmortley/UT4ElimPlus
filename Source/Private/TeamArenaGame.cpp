@@ -179,15 +179,11 @@ void AUTeamArenaGame::BeginPlay()
 		InitializeSpawnPointSystem();
 		bSpawnPointsInitialized = true;
 	}
-	//GetWorldTimerManager().SetTimerForNextTick([this]()
-	//GetWorldTimerManager().SetTimerForNextTick(this, &AUTeamArenaGame::DeferredHandleMatchStart);
-	//UE_LOG(LogTemp, Error, TEXT("GameMode::BeginPlay called"));
-
-
-	//GetWorldTimerManager().SetTimerForNextTick(this, &AUTeamArenaGame::DeferredCheckRoundWinConditions);
-
-	// We no longer start intermission here. 
-	// HandleMatchHasStarted will be called by the engine, which will call StartIntermission.
+	// Precompute all valid spawn layouts once at map load.
+	// This builds ValidLayouts_2v2 and ValidLayouts_1v1 arrays.
+	// Small maps will naturally have 0 valid 2v2 layouts, causing
+	// automatic fallback to 1v1 stacks — fixing the 2-vs-1 spawn bug.
+	PrecomputeSpawnLayouts();
 }
 
 
@@ -614,7 +610,7 @@ void AUTeamArenaGame::StartIntermission(int32 Seconds)
 /**
  * REWRITTEN: This function is now ONLY responsible for spawning players and starting the round timer.
  * It is called by CallMatchStateChangeNotify when the state changes to InProgress.
- */
+
 void AUTeamArenaGame::StartNextRound()
 {
 	UE_LOG(LogGameMode, Warning, TEXT("StartNextRound: Spawning players and starting round."));
@@ -649,32 +645,24 @@ void AUTeamArenaGame::StartNextRound()
 	Team1RoundDamage = 0.0f;
 	PlayerRoundDamage.Empty();
 	ResetPlayersForNewRound();
-	ResetSpawnSelectionForNewRound();
+	//ResetSpawnSelectionForNewRound();
 	DarkHorseCandidates.Empty();
+	ResetSpawnSelectionForNewRound();
 	ScoreAllSpawnPoints();
-	// Clear alive player arrays
-	Team0AlivePlayers.Empty();
-	Team1AlivePlayers.Empty();
-	// Draft Phase 1 (Initial Setup)
-	SelectOptimalSpawnPairForTeam(0);
-	SelectOptimalSpawnPairForTeam(1);
-	// Draft Phase 2 (Correction)
-	// Flip the "Last Mover" advantage every round so neither team can exploit it consistently.
+	// Select spawns ONCE per team — no correction pass.
+    // Alternate who picks first each round for fairness.
 	if (TotalRoundsPlayed % 2 == 0)
-
 	{
-
-		SelectOptimalSpawnPairForTeam(0); // Team 0 gets the final adjustment
-
+		SelectOptimalSpawnPairForTeam(0);
+		SelectOptimalSpawnPairForTeam(1);
 	}
-
 	else
-
 	{
-
-		SelectOptimalSpawnPairForTeam(1); // Team 1 gets the final adjustment
-
+		SelectOptimalSpawnPairForTeam(1);
+		SelectOptimalSpawnPairForTeam(0);
 	}
+
+
 	// 2. Spawn players for the *new* round
 	bAllowPlayerRespawns = true; // Allow RestartPlayer to work
 	int32 PlayersSpawned = 0;
@@ -758,6 +746,138 @@ void AUTeamArenaGame::StartNextRound()
 		&AUTeamArenaGame::DelayedInitialWinCheck, 0.25f, false);
 
 	//UE_LOG(LogGameMode, Warning, TEXT("New round started. Manually attempted to spawn %d players."), PlayersSpawned);
+}
+*/
+
+
+void AUTeamArenaGame::StartNextRound()
+{
+	UE_LOG(LogGameMode, Warning, TEXT("StartNextRound: Spawning players and starting round."));
+
+	if (bWarmupMode)
+	{
+		bRoundInProgress = false;
+		return;
+	}
+
+	if (bAnnounceTeam)
+	{
+		bAnnounceTeam = false;
+		UE_LOG(LogGameMode, Warning, TEXT("Disabled team announcements for subsequent rounds"));
+	}
+
+	// Reset per-round trackers
+	CamperTracker.Empty();
+	StartCampCheckTimer();
+	RoundWinningKiller = nullptr;
+	RoundWinningKillTime = 0.0f;
+	bPendingDarkHorseReplay = false;
+	LastRoundWinningTeamIndex = INDEX_NONE;
+	bTeam0LastManAnnounced = false;
+	bTeam1LastManAnnounced = false;
+	Team0StartingSize = 0;
+	Team1StartingSize = 0;
+	Team0RoundDamage = 0.0f;
+	Team1RoundDamage = 0.0f;
+	PlayerRoundDamage.Empty();
+	ResetPlayersForNewRound();
+	DarkHorseCandidates.Empty();
+	ResetSpawnSelectionForNewRound();
+
+	// --- USE PRECOMPUTED LAYOUTS ---
+	// This replaces the old per-team SelectOptimalSpawnPairForTeam calls.
+	// Precomputed layouts guarantee symmetric safety for both teams.
+	// On small maps where no 2v2 layout is safe, it auto-falls back to 1v1 stacks.
+	SelectSpawnLayoutForRound();
+
+	// Fallback: if layout selection failed (no valid layouts), try the old path
+	if (Team0SelectedSpawns.Num() == 0 || Team1SelectedSpawns.Num() == 0)
+	{
+		UE_LOG(LogGameMode, Warning, TEXT("StartNextRound: Layout selection failed, falling back to per-team selection"));
+		ScoreAllSpawnPoints();
+		if (TotalRoundsPlayed % 2 == 0)
+		{
+			SelectOptimalSpawnPairForTeam(0);
+			SelectOptimalSpawnPairForTeam(1);
+		}
+		else
+		{
+			SelectOptimalSpawnPairForTeam(1);
+			SelectOptimalSpawnPairForTeam(0);
+		}
+	}
+
+	// 2. Spawn players for the new round
+	bAllowPlayerRespawns = true;
+	int32 PlayersSpawned = 0;
+
+	for (FConstControllerIterator It = GetWorld()->GetControllerIterator(); It; ++It)
+	{
+		AController* C = It->Get();
+		if (!C) continue;
+
+		AUTPlayerState* PS = Cast<AUTPlayerState>(C->PlayerState);
+		if (PS && !PS->bOnlySpectator)
+		{
+			PS->bOutOfLives = false;
+			PS->ForceNetUpdate();
+
+			if (AUTPlayerController* PC = Cast<AUTPlayerController>(C))
+			{
+				PC->ChangeState(NAME_Playing);
+				PC->ClientGotoState(NAME_Playing);
+			}
+
+			RestartPlayer(C);
+			PlayersSpawned++;
+
+			if (PS->Team)
+			{
+				if (PS->Team->TeamIndex == 0)
+				{
+					Team0StartingSize++;
+					Team0AlivePlayers.Add(PS);
+				}
+				else if (PS->Team->TeamIndex == 1)
+				{
+					Team1StartingSize++;
+					Team1AlivePlayers.Add(PS);
+				}
+			}
+		}
+	}
+
+	bAllowPlayerRespawns = false;
+
+	UE_LOG(LogGameMode, Warning, TEXT("Round starting sizes - Team0: %d, Team1: %d"), Team0StartingSize, Team1StartingSize);
+
+	// 3. Set round timer
+	if (RoundTimeSeconds > 0)
+	{
+		RoundEndTimeSeconds = GetWorld()->GetTimeSeconds() + RoundTimeSeconds;
+	}
+	else
+	{
+		RoundEndTimeSeconds = 0.f;
+	}
+
+	// 4. Set final round state
+	bRoundInProgress = true;
+
+	if (AUTGameState* GS = GetWorld()->GetGameState<AUTGameState>())
+	{
+		BP_OnSetRound(true, RoundTimeSeconds, LastRoundWinningTeamIndex, Team0AlivePlayers, Team1AlivePlayers);
+		BP_OnSetIntermission(false, 0);
+		GS->ForceNetUpdate();
+	}
+
+	BroadcastLocalized(this, UUTGameMessage::StaticClass(), 0, NULL, NULL, NULL);
+
+	WinCheckHoldUntilSeconds = GetWorld()->GetTimeSeconds() + 0.25f;
+	GetWorldTimerManager().ClearTimer(InitialWinCheckHandle);
+	GetWorldTimerManager().SetTimer(
+		InitialWinCheckHandle, this,
+		&AUTeamArenaGame::DelayedInitialWinCheck, 0.25f, false);
 }
 
 
@@ -1037,40 +1157,31 @@ void AUTeamArenaGame::CleanupWorldForNewRound()
 }
 
 
+
 void AUTeamArenaGame::RestartPlayer(AController* NewPlayer)
 {
-	// Always log the attempt
-	//UE_LOG(LogGameMode, Warning, TEXT("RestartPlayer called for %s, bRoundInProgress=%s"),
-		//NewPlayer ? *NewPlayer->GetName() : TEXT("NULL"),
-		//bRoundInProgress ? TEXT("true") : TEXT("false"));
 	if (!NewPlayer) return;
 
 	if (APlayerController* PC = Cast<APlayerController>(NewPlayer))
 	{
 		if (MustSpectate(PC))
 		{
-			//UE_LOG(LogGameMode, Verbose, TEXT("RestartPlayer: Skipping spectator-only player %s"),
-			//PC->PlayerState ? *PC->PlayerState->PlayerName : TEXT("Unknown");
 			return;
 		}
 	}
+
 	if (GetMatchState() == MatchState::WaitingToStart)
 	{
-		// Use Epic's spawn logic by calling the base class implementation
 		Super::RestartPlayer(NewPlayer);
 		return;
 	}
-	// Skip if they already have a pawn (protect mid-equip)
+
 	if (NewPlayer->GetPawn())
 	{
-		//UE_LOG(LogGameMode, Warning, TEXT("  Controller already has pawn; skipping respawn"));
 		return;
 	}
 
 	AUTGameState* GS = GetGameState<AUTGameState>();
-
-	// Check if the lineup system is active.
-	// This check is from the base AUTGameMode::RestartPlayer
 	bool bLineupIsActive = (GS && GS->ActiveLineUpHelper && GS->ActiveLineUpHelper->bIsPlacingPlayers);
 
 	if (bLineupIsActive)
@@ -1079,51 +1190,109 @@ void AUTeamArenaGame::RestartPlayer(AController* NewPlayer)
 		return;
 	}
 
-	//
-	// ForceRespawnTime will still work during warmup and pre-match phases
-	//bool hasStarted = HasMatchStarted();
 	const bool bShouldAllowSpawn = (bAllowRespawnMidRound || bAllowPlayerRespawns || bWarmupMode || GetMatchState() == MatchState::WaitingToStart);
-
-	//UE_LOG(LogGameMode, Warning, TEXT("  bAllowRespawnMidRound=%s, bAllowPlayerRespawns=%s, bShouldAllowSpawn=%s"),
-		//bAllowRespawnMidRound ? TEXT("true") : TEXT("false"),
-		//bAllowPlayerRespawns ? TEXT("true") : TEXT("false"),
-		//bShouldAllowSpawn ? TEXT("true") : TEXT("false"));
-
 
 	if (bShouldAllowSpawn)
 	{
-		// FIX: Call your ChoosePlayerStart and actually use the result
 		AActor* ChosenStart = ChoosePlayerStart_Implementation(NewPlayer);
-		//UE_LOG(LogGameMode, Warning, TEXT("RestartPlayer: Chosen PlayerStart: %s"),
-		//	ChosenStart ? *ChosenStart->GetName() : TEXT("NULL"));
 
-		OverriddenPlayerStart = ChosenStart;
-		//bSetPlayerDefaultsNewSpawn = true;
-		if (ChosenStart)
-		{
-			// Use RestartPlayerAtPlayerStart to ensure we use YOUR chosen spawn point
-			//RestartPlayerAtPlayerStart(NewPlayer, ChosenStart);
-			Super::RestartPlayer(NewPlayer);
-			OverriddenPlayerStart = nullptr;
-		}
-		/*else
-		{
-			// Fallback to base logic if no spawn found
-			Super::RestartPlayer(NewPlayer);
-		}*/
+		OverriddenPlayerStart  = ChosenStart;
+		Super::RestartPlayer(NewPlayer);
+		OverriddenPlayerStart = nullptr;
 
-		if (NewPlayer && NewPlayer->GetPawn())
+		if (!NewPlayer->GetPawn())
 		{
-			//return;
-		}
-		else
-		{
-			if (!bLineupIsActive || !bWarmupMode) {
-				UE_LOG(LogGameMode, Warning, TEXT("RestartPlayer: FAILED to spawn pawn!"));
-			}
+			UE_LOG(LogGameMode, Warning, TEXT("RestartPlayer: FAILED to spawn pawn for %s"),
+				NewPlayer->PlayerState ? *NewPlayer->PlayerState->PlayerName : TEXT("Unknown"));
 		}
 	}
 }
+
+
+bool AUTeamArenaGame::ValidateSpawnLocation(const FVector& TestLocation)
+{
+	// UT Characters typically have a CapsuleRadius of ~34.0f and HalfHeight of ~88.0f
+	const float CapsuleRadius = 40.0f;
+	const float CapsuleHalfHeight = 80.0f;
+
+	FHitResult Hit;
+	FCollisionQueryParams Params;
+	Params.bTraceComplex = false;
+
+	// We use a Sphere Sweep instead of a Line Trace. 
+	// This simulates the width of the player to ensure they don't spawn clipping into a wall.
+	FCollisionShape SphereShape = FCollisionShape::MakeSphere(CapsuleRadius);
+
+	// 1. FLOOR CHECK: Sweep downwards to find solid ground
+	// Start slightly above the center to avoid starting already clipped into the floor
+	FVector TraceStart = TestLocation + FVector(0.f, 0.f, 10.f);
+	// Sweep down just enough to find the floor, but not so far they drop off a cliff
+	FVector TraceEnd = TestLocation - FVector(0.f, 0.f, CapsuleHalfHeight + 50.f);
+
+	bool bHitGround = GetWorld()->SweepSingleByChannel(
+		Hit, TraceStart, TraceEnd, FQuat::Identity, ECC_WorldStatic, SphereShape, Params);  
+
+	if (!bHitGround)
+	{
+		return false; // No floor found within safe drop distance (off a cliff or into the void)
+	}
+
+	// 2. STEEPNESS CHECK: Ensure the ground is flat enough to stand on (approx 45 degrees max)
+	if (Hit.ImpactNormal.Z < 0.7f)
+	{
+		return false; // Ground is too steep (it's a wall or steep slope)
+	}
+
+	// 3. HEADROOM CHECK: Sweep upwards to ensure the player's head won't clip the ceiling
+	FVector HeadLocation = TestLocation + FVector(0.f, 0.f, CapsuleHalfHeight);
+	bool bHitCeiling = GetWorld()->SweepSingleByChannel(
+		Hit, TestLocation, HeadLocation, FQuat::Identity, ECC_WorldStatic, SphereShape, Params);
+
+	if (bHitCeiling)
+	{
+		return false; // Hit a ceiling, overhang, or low-hanging geometry
+	}
+
+	return true;
+}
+
+
+
+APawn* AUTeamArenaGame::SpawnDefaultPawnFor_Implementation(AController* NewPlayer, AActor* StartSpot)
+{
+	// The default APawn::SpawnCollisionHandlingMethod is
+	// AdjustIfPossibleButDontSpawnIfColliding (see Pawn.cpp:65).
+	// When two teammates spawn at the same PlayerStart (stack spawn),
+	// the engine calls FindTeleportSpot which nudges the second player
+	// up to ~800 units in XY — potentially right into the enemy team.
+	//
+	// Fix: Use AlwaysSpawn so the pawn spawns exactly at the PlayerStart.
+	// The engine's character movement will naturally push overlapping
+	// capsules apart within 1-2 frames (DepenetrationVelocity), which
+	// only moves them ~40-60 units — safe and predictable.
+
+	FRotator StartRotation(ForceInit);
+	StartRotation.Yaw = StartSpot->GetActorRotation().Yaw;
+	FVector StartLocation = StartSpot->GetActorLocation();
+
+	FActorSpawnParameters SpawnInfo;
+	SpawnInfo.Instigator = Instigator;
+	SpawnInfo.ObjectFlags |= RF_Transient;
+	SpawnInfo.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+
+	UClass* PawnClass = GetDefaultPawnClassForController(NewPlayer);
+	APawn* ResultPawn = GetWorld()->SpawnActor<APawn>(PawnClass, FTransform(StartRotation, StartLocation), SpawnInfo);
+
+	if (!ResultPawn)
+	{
+		UE_LOG(LogGameMode, Warning, TEXT("SpawnDefaultPawnFor: Couldn't spawn Pawn of type %s at %s"),
+			*GetNameSafe(PawnClass), *StartLocation.ToString());
+	}
+
+	return ResultPawn;
+}
+
+
 
 // Example: Your existing ScoreKill_Implementation (no changes needed)
 void AUTeamArenaGame::ScoreKill_Implementation(AController* Killer, AController* Other, APawn* KilledPawn, TSubclassOf<UDamageType> DamageType)
@@ -1255,13 +1424,7 @@ AActor* AUTeamArenaGame::ChoosePlayerStart_Implementation(AController* Player)
 	const int32 TeamIndex = PS->Team->TeamIndex;
 	TArray<APlayerStart*>& SelectedSpawns = (TeamIndex == 0) ? Team0SelectedSpawns : Team1SelectedSpawns;
 
-	/*
-	* calling this now in StartNextRound
-	if (SelectedSpawns.Num() == 0)
-	{
-		SelectOptimalSpawnPairForTeam(TeamIndex);
-	}
-	*/
+
 	if (SelectedSpawns.Num() == 0)
 	{
 		UE_LOG(LogGameMode, Warning, TEXT("ChoosePlayerStart: No spawns selected for team %d, using fallback"), TeamIndex);
@@ -1325,19 +1488,6 @@ AActor* AUTeamArenaGame::ChoosePlayerStart_Implementation(AController* Player)
 		return Super::ChoosePlayerStart_Implementation(Player);
 	}
 
-	FVector BaseLocation = ChosenSpawn->GetActorLocation();
-	if (!IsLocationClearOfPlayers(BaseLocation))
-	{
-		for (int32 Attempt = 0; Attempt < MaxSpawnOffsetAttempts; ++Attempt)
-		{
-			FVector OffsetLocation = FindSafeSpawnOffset(ChosenSpawn, Attempt);
-			if (IsLocationClearOfPlayers(OffsetLocation))
-			{
-				//UE_LOG(LogGameMode, Log, TEXT("Using offset spawn location for %s (attempt %d)"), *PS->PlayerName, Attempt);
-				break;
-			}
-		}
-	}
 
 	UE_LOG(LogGameMode, Log, TEXT("Selected spawn %s for team %d player %s"),
 		*ChosenSpawn->GetName(), TeamIndex, *PS->PlayerName);
@@ -1360,6 +1510,250 @@ AActor* AUTeamArenaGame::FindPlayerStart_Implementation(AController* Player, con
 }
 
 
+void AUTeamArenaGame::PrecomputeSpawnLayouts()
+{
+	ValidLayouts_2v2.Empty();
+	ValidLayouts_1v1.Empty();
+
+	// Gather all spawn points
+	TArray<APlayerStart*> AllSpawns;
+	for (TActorIterator<APlayerStart> It(GetWorld()); It; ++It)
+	{
+		if (APlayerStart* Spawn = *It)
+		{
+			AllSpawns.Add(Spawn);
+		}
+	}
+
+	const int32 N = AllSpawns.Num();
+	if (N < 2)
+	{
+		UE_LOG(LogGameMode, Error, TEXT("PrecomputeSpawnLayouts: Only %d spawns on map!"), N);
+		return;
+	}
+
+	//const float SafetyThreshold = MinimumEnemyHorizontalDistance; // Your BP value (6000)
+	const float SafetyThreshold = FMath::Min(MinimumEnemyHorizontalDistance, 2900.0f);
+	// -------------------------------------------------------
+	// PHASE 1: Build all valid 2v2 layouts
+	// -------------------------------------------------------
+	// T0 pair = (a, b), T1 pair = (c, d), all four unique spawns
+	for (int32 a = 0; a < N; ++a)
+	{
+		for (int32 b = a + 1; b < N; ++b)
+		{
+			// Check teammate separation for T0
+			float T0Sep = (AllSpawns[a]->GetActorLocation() - AllSpawns[b]->GetActorLocation()).Size2D();
+			if (T0Sep < MinTeammateSeparation2D || T0Sep > MaxTeammateSeparation2D)
+				continue;
+
+			for (int32 c = 0; c < N; ++c)
+			{
+				if (c == a || c == b) continue;
+
+				for (int32 d = c + 1; d < N; ++d)
+				{
+					if (d == a || d == b) continue;
+
+					// Check teammate separation for T1
+					float T1Sep = (AllSpawns[c]->GetActorLocation() - AllSpawns[d]->GetActorLocation()).Size2D();
+					if (T1Sep < MinTeammateSeparation2D || T1Sep > MaxTeammateSeparation2D)
+						continue;
+
+					// --- SAFETY CHECK: All cross-team distances must be safe ---
+					// This is the KEY invariant. Every T0 spawn must be far from every T1 spawn.
+					float MinCross = FLT_MAX;
+
+					// 4 cross-team checks (2 x 2)
+					float D_ac = (AllSpawns[a]->GetActorLocation() - AllSpawns[c]->GetActorLocation()).Size2D();
+					float D_ad = (AllSpawns[a]->GetActorLocation() - AllSpawns[d]->GetActorLocation()).Size2D();
+					float D_bc = (AllSpawns[b]->GetActorLocation() - AllSpawns[c]->GetActorLocation()).Size2D();
+					float D_bd = (AllSpawns[b]->GetActorLocation() - AllSpawns[d]->GetActorLocation()).Size2D();
+
+					MinCross = FMath::Min(MinCross, D_ac);
+					MinCross = FMath::Min(MinCross, D_ad);
+					MinCross = FMath::Min(MinCross, D_bc);
+					MinCross = FMath::Min(MinCross, D_bd);
+
+					// HARD REJECT: if any cross-team pair is too close, this layout is invalid
+					if (MinCross < SafetyThreshold)
+						continue;
+
+					// --- GRADE THIS LAYOUT ---
+					FSpawnLayout Layout;
+					Layout.T0_Primary = AllSpawns[a];
+					Layout.T0_Secondary = AllSpawns[b];
+					Layout.T1_Primary = AllSpawns[c];
+					Layout.T1_Secondary = AllSpawns[d];
+					Layout.MinCrossDistance2D = MinCross;
+					Layout.T0Separation = T0Sep;
+					Layout.T1Separation = T1Sep;
+					Layout.UsageCount = 0;
+
+					// Quality score: reward maximum cross-team distance
+					// with a smaller bonus for good teammate spread
+					Layout.QualityScore = MinCross
+						+ FMath::Min(T0Sep, 1500.0f) * 0.3f
+						+ FMath::Min(T1Sep, 1500.0f) * 0.3f;
+
+					ValidLayouts_2v2.Add(Layout);
+				}
+			}
+		}
+	}
+
+	// -------------------------------------------------------
+	// PHASE 2: Build all valid 1v1 (stack) layouts
+	// -------------------------------------------------------
+	// Each team gets ONE spawn point. Both players on each team spawn there.
+	const float StackSafetyThreshold = FMath::Max(SafetyThreshold, MinimumStackSpawnDistance2D);
+
+	for (int32 a = 0; a < N; ++a)
+	{
+		for (int32 b = 0; b < N; ++b)
+		{
+			if (b == a) continue;
+
+			float Dist2D = (AllSpawns[a]->GetActorLocation() - AllSpawns[b]->GetActorLocation()).Size2D();
+
+			if (Dist2D < StackSafetyThreshold)
+				continue;
+
+			FSpawnLayout Layout;
+			Layout.T0_Primary = AllSpawns[a];
+			Layout.T0_Secondary = nullptr; // Stack: both players spawn here
+			Layout.T1_Primary = AllSpawns[b];
+			Layout.T1_Secondary = nullptr; // Stack: both players spawn here
+			Layout.MinCrossDistance2D = Dist2D;
+			Layout.T0Separation = 0.f;
+			Layout.T1Separation = 0.f;
+			Layout.UsageCount = 0;
+			Layout.QualityScore = Dist2D;
+
+			ValidLayouts_1v1.Add(Layout);
+		}
+	}
+
+	// Sort both arrays by quality (best first)
+	ValidLayouts_2v2.Sort([](const FSpawnLayout& A, const FSpawnLayout& B)
+		{
+			return A.QualityScore > B.QualityScore;
+		});
+
+	ValidLayouts_1v1.Sort([](const FSpawnLayout& A, const FSpawnLayout& B)
+		{
+			return A.QualityScore > B.QualityScore;
+		});
+
+	UE_LOG(LogGameMode, Log, TEXT("=== SPAWN PRECOMPUTE COMPLETE ==="));
+	UE_LOG(LogGameMode, Log, TEXT("  Valid 2v2 layouts: %d"), ValidLayouts_2v2.Num());
+	UE_LOG(LogGameMode, Log, TEXT("  Valid 1v1 layouts: %d"), ValidLayouts_1v1.Num());
+
+	if (ValidLayouts_2v2.Num() > 0)
+	{
+		UE_LOG(LogGameMode, Log, TEXT("  Best 2v2 cross distance: %.0f"), ValidLayouts_2v2[0].MinCrossDistance2D);
+		UE_LOG(LogGameMode, Log, TEXT("  Worst 2v2 cross distance: %.0f"), ValidLayouts_2v2.Last().MinCrossDistance2D);
+	}
+
+	if (ValidLayouts_2v2.Num() == 0 && ValidLayouts_1v1.Num() == 0)
+	{
+		UE_LOG(LogGameMode, Error, TEXT("  !!! NO VALID SPAWN LAYOUTS - MAP IS BROKEN OR THRESHOLD TOO HIGH !!!"));
+	}
+	else if (ValidLayouts_2v2.Num() == 0)
+	{
+		UE_LOG(LogGameMode, Warning, TEXT("  No valid 2v2 layouts - all rounds will use 1v1 stack spawns on this map"));
+	}
+}
+
+void AUTeamArenaGame::SelectSpawnLayoutForRound()
+{
+	Team0SelectedSpawns.Empty();
+	Team1SelectedSpawns.Empty();
+
+	// Decide which pool to use
+	//TArray<FSpawnLayout>& Pool = (ValidLayouts_2v2.Num() > 0) ? ValidLayouts_2v2 : ValidLayouts_1v1;
+	bool bForce1v1 = (TotalRoundsPlayed % 3 == 0) && (ValidLayouts_1v1.Num() > 0);
+	TArray<FSpawnLayout>& Pool = (!bForce1v1 && ValidLayouts_2v2.Num() > 0) ? ValidLayouts_2v2 : ValidLayouts_1v1;
+
+
+	if (Pool.Num() == 0)
+	{
+		UE_LOG(LogGameMode, Error, TEXT("SelectSpawnLayoutForRound: No valid layouts available!"));
+		return;
+	}
+
+	// -------------------------------------------------------
+	// SELECTION STRATEGY:
+	// Pick from the top-quality layouts, weighted against usage.
+	// This gives you variety without ever picking a bad layout.
+	// -------------------------------------------------------
+
+	// Consider the top N layouts (or all if fewer exist)
+	const int32 PoolSize = FMath::Min(Pool.Num(), 30);
+
+	// Score each candidate: quality minus usage penalty
+	int32 BestIndex = 0;
+	float BestSelectionScore = -FLT_MAX;
+
+	for (int32 i = 0; i < PoolSize; ++i)
+	{
+		// Penalize repeated use. Each prior use reduces score.
+		// The penalty scales so even the best layout gets rotated out.
+		float UsagePenalty = Pool[i].UsageCount * 3000.0f;
+
+		// Small random jitter for variety when scores are close
+		float Jitter = FMath::FRandRange(0.0f, 500.0f);
+
+		float SelectionScore = Pool[i].QualityScore - UsagePenalty + Jitter;
+
+		if (SelectionScore > BestSelectionScore)
+		{
+			BestSelectionScore = SelectionScore;
+			BestIndex = i;
+		}
+	}
+
+	FSpawnLayout& Chosen = Pool[BestIndex];
+	Chosen.UsageCount++;
+
+	// -------------------------------------------------------
+	// TEAM ASSIGNMENT:
+	// Alternate which team gets which side each round.
+	// On even rounds, T0 gets the T0 slots. On odd rounds, swap.
+	// This replaces your entire team-axis rotation system.
+	// -------------------------------------------------------
+	bool bSwapTeams = (TotalRoundsPlayed % 2 == 1);
+
+	APlayerStart* FinalT0_Primary = bSwapTeams ? Chosen.T1_Primary : Chosen.T0_Primary;
+	APlayerStart* FinalT0_Secondary = bSwapTeams ? Chosen.T1_Secondary : Chosen.T0_Secondary;
+	APlayerStart* FinalT1_Primary = bSwapTeams ? Chosen.T0_Primary : Chosen.T1_Primary;
+	APlayerStart* FinalT1_Secondary = bSwapTeams ? Chosen.T0_Secondary : Chosen.T1_Secondary;
+
+	// Assign Team 0
+	Team0SelectedSpawns.Add(FinalT0_Primary);
+	if (FinalT0_Secondary)
+	{
+		Team0SelectedSpawns.Add(FinalT0_Secondary);
+	}
+
+	// Assign Team 1
+	Team1SelectedSpawns.Add(FinalT1_Primary);
+	if (FinalT1_Secondary)
+	{
+		Team1SelectedSpawns.Add(FinalT1_Secondary);
+	}
+
+	UE_LOG(LogGameMode, Log, TEXT("=== ROUND %d SPAWN LAYOUT ==="), TotalRoundsPlayed);
+	UE_LOG(LogGameMode, Log, TEXT("  Layout index: %d (Usage: %d)  CrossDist: %.0f"),
+		BestIndex, Chosen.UsageCount, Chosen.MinCrossDistance2D);
+	UE_LOG(LogGameMode, Log, TEXT("  Team 0: %s + %s"),
+		FinalT0_Primary ? *FinalT0_Primary->GetName() : TEXT("NULL"),
+		FinalT0_Secondary ? *FinalT0_Secondary->GetName() : TEXT("STACK"));
+	UE_LOG(LogGameMode, Log, TEXT("  Team 1: %s + %s"),
+		FinalT1_Primary ? *FinalT1_Primary->GetName() : TEXT("NULL"),
+		FinalT1_Secondary ? *FinalT1_Secondary->GetName() : TEXT("STACK"));
+}
+
 
 void AUTeamArenaGame::InitializeSpawnPointSystem()
 {
@@ -1377,7 +1771,10 @@ void AUTeamArenaGame::InitializeSpawnPointSystem()
 		UE_LOG(LogGameMode, Error, TEXT("InitializeSpawnPointSystem: Insufficient spawn points (%d), need at least 4"), AllSpawnPoints.Num());
 		return;
 	}
+
+	// Score FIRST so HeightScore is populated before we sort by it
 	ScoreAllSpawnPoints();
+
 	// Only run this if we have enough spawns to safely remove some
 	if (AllSpawnPoints.Num() > 4)
 	{
@@ -1387,9 +1784,8 @@ void AUTeamArenaGame::InitializeSpawnPointSystem()
 			return A.HeightScore > B.HeightScore;
 		});
 
-		UE_LOG(LogGameMode, Warning, TEXT("InitializeSpawnPointSystem: Removing top  spawn for fairness."));
+		UE_LOG(LogGameMode, Warning, TEXT("InitializeSpawnPointSystem: Removing top spawn for fairness."));
 
-		// Log which spawns we're about to remove
 		if (AllSpawnPoints[0].PlayerStart)
 		{
 			UE_LOG(LogGameMode, Warning, TEXT("  - Removing: %s (HeightScore: %f)"), *AllSpawnPoints[0].PlayerStart->GetName(), AllSpawnPoints[0].HeightScore);
@@ -1580,7 +1976,9 @@ void AUTeamArenaGame::SelectOptimalSpawnPairForTeam(int32 TeamIndex)
 	// We do not care about "average" distance. If a spawn is close to an enemy, it is dead to us.
 
 	TArray<FSpawnPointData*> SafeCandidates;
-	const float HardSafetyThreshold = 2000.0f; // Minimum safe distance (Teleport range is ~1500)
+	//const float HardSafetyThreshold = 2700.0f; // Minimum safe distance (Teleport range is ~1500)
+	//const float HardSafetyThreshold = MinimumEnemyHorizontalDistance;
+	const float SafetyThreshold = FMath::Min(MinimumEnemyHorizontalDistance, 4500.0f);
 
 	if (EnemySpawns.Num() > 0)
 	{
@@ -1591,11 +1989,13 @@ void AUTeamArenaGame::SelectOptimalSpawnPairForTeam(int32 TeamIndex)
 			bool bIsStrictlySafe = true;
 			for (APlayerStart* EnemySpawn : EnemySpawns)
 			{
-				float Dist = FVector::Dist(Cand->PlayerStart->GetActorLocation(), EnemySpawn->GetActorLocation());
-				if (Dist < HardSafetyThreshold)
+				float Dist3D = FVector::Dist(Cand->PlayerStart->GetActorLocation(), EnemySpawn->GetActorLocation());
+				float Dist2D = (Cand->PlayerStart->GetActorLocation() - EnemySpawn->GetActorLocation()).Size2D();
+
+				if (Dist3D < MinimumEnemySpawnDistance || Dist2D < MinimumEnemyHorizontalDistance)
 				{
 					bIsStrictlySafe = false;
-					break; // Too close! Discard this spawn immediately.
+					break;
 				}
 			}
 
@@ -1673,198 +2073,6 @@ void AUTeamArenaGame::SelectOptimalSpawnPairForTeam(int32 TeamIndex)
 	}
 }
 
-
-/*
-void AUTeamArenaGame::FindMaxDistanceSpawnPair(const TArray<FSpawnPointData*>& CandidateSpawns, const TArray<APlayerStart*>& EnemySpawns, int32 TeamIndex, APlayerStart*& OutPrimary, APlayerStart*& OutSecondary)
-{
-	OutPrimary = nullptr;
-	OutSecondary = nullptr;
-
-	if (CandidateSpawns.Num() < 2)
-	{
-		if (CandidateSpawns.Num() == 1)
-		{
-			OutPrimary = CandidateSpawns[0]->PlayerStart;
-		}
-		return;
-	}
-
-	// --- SETUP WEIGHTS ---
-	float CurrentDistanceWeight = SpawnDistanceWeight;
-	float CurrentHeightWeight = SpawnHeightWeight;
-	float CurrentUsageWeight = SpawnUsageWeight;
-	float CurrentSeparationWeight = SpawnSeparationWeight;
-
-	// Home-side bonus: prefer spawns on the team's designated side, but don't exclude others
-	const float HomeSideBonus = 500.0f;
-
-	float TotalWeight = CurrentDistanceWeight + CurrentHeightWeight + CurrentUsageWeight + CurrentSeparationWeight;
-	if (TotalWeight > KINDA_SMALL_NUMBER)
-	{
-		CurrentDistanceWeight /= TotalWeight;
-		CurrentHeightWeight /= TotalWeight;
-		CurrentUsageWeight /= TotalWeight;
-		CurrentSeparationWeight /= TotalWeight;
-	}
-
-	struct FSpawnPairScore
-	{
-		float Score;
-		int32 Index1;
-		int32 Index2;
-		FSpawnPairScore(float InScore, int32 InIndex1, int32 InIndex2) : Score(InScore), Index1(InIndex1), Index2(InIndex2) {}
-	};
-
-	TArray<FSpawnPairScore> ScoredPairs;
-	ScoredPairs.Reserve(CandidateSpawns.Num() * 2);
-
-	for (int32 i = 0; i < CandidateSpawns.Num(); ++i)
-	{
-		for (int32 j = i + 1; j < CandidateSpawns.Num(); ++j)
-		{
-			APlayerStart* Spawn1 = CandidateSpawns[i]->PlayerStart;
-			APlayerStart* Spawn2 = CandidateSpawns[j]->PlayerStart;
-			if (!Spawn1 || !Spawn2) continue;
-
-			// 1. Enemy Distance Score
-			float MinDist1 = CalculateMinDistanceToEnemySpawns(Spawn1, EnemySpawns);
-			float MinDist2 = CalculateMinDistanceToEnemySpawns(Spawn2, EnemySpawns);
-
-			// 2. Vertical Stacking Check (The Bio/Mini Fix)
-			float MinHorizontalDist1 = 100000.0f;
-			float MinHorizontalDist2 = 100000.0f;
-
-			if (EnemySpawns.Num() > 0)
-			{
-				for (APlayerStart* EnemySpawn : EnemySpawns)
-				{
-					if (!EnemySpawn) continue;
-					float Dist2D_1 = (Spawn1->GetActorLocation() - EnemySpawn->GetActorLocation()).Size2D();
-					float Dist2D_2 = (Spawn2->GetActorLocation() - EnemySpawn->GetActorLocation()).Size2D();
-
-					MinHorizontalDist1 = FMath::Min(MinHorizontalDist1, Dist2D_1);
-					MinHorizontalDist2 = FMath::Min(MinHorizontalDist2, Dist2D_2);
-				}
-			}
-
-			float HeightScore1 = CandidateSpawns[i]->HeightScore;
-			float HeightScore2 = CandidateSpawns[j]->HeightScore;
-
-			float UsageScore1 = 1.0f / (1.0f + CandidateSpawns[i]->GetUsageCountForTeam(0) + CandidateSpawns[i]->GetUsageCountForTeam(1));
-			float UsageScore2 = 1.0f / (1.0f + CandidateSpawns[j]->GetUsageCountForTeam(0) + CandidateSpawns[j]->GetUsageCountForTeam(1));
-
-			// Teammate Separation Score
-			float SpawnSeparation = FVector::Dist(Spawn1->GetActorLocation(), Spawn2->GetActorLocation());
-
-			// If teammates are 700 units apart, they get MAX score. 
-			float SeparationScore = FMath::Min(SpawnSeparation / 700.0f, 1.0f);
-
-			float CombinedScore = (MinDist1 + MinDist2) * CurrentDistanceWeight +
-				(HeightScore1 + HeightScore2) * CurrentHeightWeight +
-				(UsageScore1 + UsageScore2) * CurrentUsageWeight +
-				SeparationScore * CurrentSeparationWeight;
-
-			// 3. Apply Penalties
-			if (EnemySpawns.Num() > 0)
-			{
-				// Penalize Vertical Stacking (Bio vs Mini)
-				if (MinHorizontalDist1 < MinimumEnemyHorizontalDistance || MinHorizontalDist2 < MinimumEnemyHorizontalDistance)
-				{
-					CombinedScore -= 50000.0f;
-				}
-
-				// Penalize 3D Proximity
-				if (MinDist1 < MinimumEnemySpawnDistance || MinDist2 < MinimumEnemySpawnDistance)
-				{
-					CombinedScore -= 10000.0f;
-				}
-			}
-
-			// 4. Apply Home-Side Bonus (soft preference, not hard requirement)
-			// This encourages teams to spawn on their designated side when it's safe,
-			// but allows escaping to the other side when necessary
-			if (IsSpawnOnHomeSide(*CandidateSpawns[i], TeamIndex))
-			{
-				CombinedScore += HomeSideBonus;
-			}
-			if (IsSpawnOnHomeSide(*CandidateSpawns[j], TeamIndex))
-			{
-				CombinedScore += HomeSideBonus;
-			}
-
-			CombinedScore += FMath::FRandRange(-0.01f, 0.01f);
-			ScoredPairs.Add(FSpawnPairScore(CombinedScore, i, j));
-		}
-	}
-
-	if (ScoredPairs.Num() > 0)
-	{
-		ScoredPairs.Sort([](const FSpawnPairScore& A, const FSpawnPairScore& B) { return A.Score > B.Score; });
-		const FSpawnPairScore& SelectedPair = ScoredPairs[0];
-
-		// --- SAFETY FALLBACK CHECK ---
-		// If the best pair has a score < -3000, it means it triggered one of our heavy penalties 
-		// (Vertical Stacking or Proximity). We should NOT use it.
-		if (SelectedPair.Score < -3000.0f)
-		{
-			UE_LOG(LogGameMode, Warning, TEXT("Spawn System: CRITICAL - All spawn pairs failed safety checks (Score: %.2f). Searching ALL spawns for safe location."), SelectedPair.Score);
-
-			// Find the FURTHEST spawns from enemies - no threshold filtering here!
-			// The fallback is a last resort, so we just want maximum distance, period.
-			APlayerStart* BestFallback = nullptr;
-			APlayerStart* SecondBestFallback = nullptr;
-			float BestFallbackDist = -1.0f;
-			float SecondBestDist = -1.0f;
-
-			for (FSpawnPointData& SpawnData : AllSpawnPoints)
-			{
-				if (!SpawnData.PlayerStart) continue;
-
-				float Dist = CalculateMinDistanceToEnemySpawns(SpawnData.PlayerStart, EnemySpawns);
-
-				if (Dist > BestFallbackDist)
-				{
-					// Promote current best to second best
-					SecondBestFallback = BestFallback;
-					SecondBestDist = BestFallbackDist;
-					// New best
-					BestFallbackDist = Dist;
-					BestFallback = SpawnData.PlayerStart;
-				}
-				else if (Dist > SecondBestDist && SpawnData.PlayerStart != BestFallback)
-				{
-					SecondBestDist = Dist;
-					SecondBestFallback = SpawnData.PlayerStart;
-				}
-			}
-
-			if (BestFallback)
-			{
-				UE_LOG(LogGameMode, Warning, TEXT("  - Emergency Fallback Primary: %s (Distance: %.0f)"), *BestFallback->GetName(), BestFallbackDist);
-				OutPrimary = BestFallback;
-
-				// Give them a second spawn if reasonably far
-				if (SecondBestFallback && SecondBestDist > 4000.0f)
-				{
-					UE_LOG(LogGameMode, Warning, TEXT("  - Emergency Fallback Secondary: %s (Distance: %.0f)"), *SecondBestFallback->GetName(), SecondBestDist);
-					OutSecondary = SecondBestFallback;
-				}
-				else
-				{
-					UE_LOG(LogGameMode, Warning, TEXT("  - No safe secondary spawn, forcing stack spawn"));
-					OutSecondary = nullptr;
-				}
-				return;
-			}
-		}
-
-
-		// Normal assignment if the pair is valid
-		OutPrimary = CandidateSpawns[SelectedPair.Index1]->PlayerStart;
-		OutSecondary = CandidateSpawns[SelectedPair.Index2]->PlayerStart;
-	}
-}
-*/
 
 
 
@@ -2119,73 +2327,7 @@ FVector AUTeamArenaGame::FindSafeSpawnOffset(APlayerStart* BaseSpawn, int32 Atte
 	return TestLocation;
 }
 
-/*
-// IMPROVED: Add randomization to candidate selection
-TArray<FSpawnPointData*> AUTeamArenaGame::GetSpawnCandidatesForTeam(int32 TeamIndex)
-{
-	TArray<FSpawnPointData*> Candidates;
-	bool bSwapSides = (CurrentRoundNumber % 2 == 1);
 
-	for (FSpawnPointData& SpawnData : AllSpawnPoints)
-	{
-		if (!SpawnData.PlayerStart) continue;
-
-		bool bIsTeamSide;
-		if (bSwapSides)
-		{
-			// ODD round: Team 0 is Positive, Team 1 is Negative
-			bIsTeamSide = (TeamIndex == 0 && SpawnData.TeamSideScore >= 0.0f) || (TeamIndex == 1 && SpawnData.TeamSideScore <= 0.0f);
-		}
-		else
-		{
-			// EVEN round: Team 0 is Negative, Team 1 is Positive
-			bIsTeamSide = (TeamIndex == 0 && SpawnData.TeamSideScore <= 0.0f) || (TeamIndex == 1 && SpawnData.TeamSideScore >= 0.0f);
-		}
-
-		if (bIsTeamSide || FMath::Abs(SpawnData.TeamSideScore) < 0.2f)
-		{
-			Candidates.Add(&SpawnData);
-		}
-	}
-
-	// NEW: Don't always sort the same way - add randomization
-	int32 SortStrategy = CurrentRoundNumber % 2;
-
-	if (SortStrategy == 0)
-	{
-		// Usage-first sorting (original)
-		Candidates.Sort([TeamIndex](const FSpawnPointData& A, const FSpawnPointData& B)
-			{
-				int32 UsageA = A.GetUsageCountForTeam(TeamIndex);
-				int32 UsageB = B.GetUsageCountForTeam(TeamIndex);
-				if (UsageA != UsageB)
-				{
-					return UsageA < UsageB;
-				}
-				// Add randomness to break ties
-				return FMath::RandBool();
-			});
-	}
-	else
-	{
-		// Quality-first sorting with randomization
-		Candidates.Sort([TeamIndex](const FSpawnPointData& A, const FSpawnPointData& B)
-			{
-				float ScoreA = A.HeightScore + FMath::Abs(A.TeamSideScore);
-				float ScoreB = B.HeightScore + FMath::Abs(B.TeamSideScore);
-
-				// If scores are very close, randomize
-				if (FMath::Abs(ScoreA - ScoreB) < 0.1f)
-				{
-					return FMath::RandBool();
-				}
-				return ScoreA > ScoreB;
-			});
-	}
-
-	return Candidates;
-}
-*/
 
 
 // IMPROVED: Add randomization to candidate selection
@@ -3211,7 +3353,6 @@ void AUTeamArenaGame::BP_RestartCurrentRound()
 		return;
 	}
 
-	// Only allow round restart during a match (not in warmup or when match hasn't started)
 	if (bWarmupMode || !HasMatchStarted())
 	{
 		UE_LOG(LogGameMode, Warning, TEXT("BP_RestartCurrentRound: Cannot restart round - match not in progress"));
@@ -3245,30 +3386,51 @@ void AUTeamArenaGame::BP_RestartCurrentRound()
 	ResetPlayersForNewRound();
 	CleanupWorldForNewRound();
 
-	// Reset spawn selection for the new round attempt
+	// Use the precomputed layout system — same as StartNextRound.
+	// ResetSpawnSelectionForNewRound increments CurrentRoundNumber,
+	// which SelectSpawnLayoutForRound uses for team-side alternation.
 	ResetSpawnSelectionForNewRound();
+	SelectSpawnLayoutForRound();
 
-	// Phase 1: Initial + immediate correction
-	SelectOptimalSpawnPairForTeam(0);
-	SelectOptimalSpawnPairForTeam(1);
-	SelectOptimalSpawnPairForTeam(0);  // T0 reacts to T1
-	SelectOptimalSpawnPairForTeam(1);  // T1 reacts to corrected T0
+	// Start a brief intermission before the new round
+	StartIntermission(4);
+}
 
-	// --- Phase 2: The "Advantage" ---
-	// If it's Team 0's turn to have the advantage, they get one final move 
-	// to counter Team 1's optimized position.
-	// (If it's Team 1's turn, we do nothing, because T1 *just moved* in the line above).
-	if (TotalRoundsPlayed % 2 == 0)
+
+
+void AUTeamArenaGame::BP_SetTeamScores(int32 RedScore, int32 BlueScore)
+{
+	if (!HasAuthority())
 	{
-		SelectOptimalSpawnPairForTeam(0);
+		UE_LOG(LogGameMode, Warning, TEXT("BP_SetTeamScores: Only server can set scores"));
+		return;
 	}
 
-	// Start a brief intermission before the new round (3 seconds)
-	StartIntermission(4);
+	if (!Teams.IsValidIndex(0) || !Teams.IsValidIndex(1))
+	{
+		UE_LOG(LogGameMode, Warning, TEXT("BP_SetTeamScores: Teams not initialized"));
+		return;
+	}
 
-	// Broadcast a message to let everyone know the round was restarted
-	//BroadcastLocalized(this, UUTGameMessage::StaticClass(), 10, nullptr, nullptr, nullptr); // You might want to create a custom message for this
+	const int32 OldRed = Teams[0]->Score;
+	const int32 OldBlue = Teams[1]->Score;
+
+	Teams[0]->Score = FMath::Max(0, RedScore);
+	Teams[1]->Score = FMath::Max(0, BlueScore);
+
+	Teams[0]->ForceNetUpdate();
+	Teams[1]->ForceNetUpdate();
+
+	// Keep lead/domination tracking in sync
+	PreviousRedScore = Teams[0]->Score;
+	PreviousBlueScore = Teams[1]->Score;
+	bHasBroadcastTeamDominating = false;
+
+	UE_LOG(LogGameMode, Warning, TEXT("BP_SetTeamScores: Red %d->%d, Blue %d->%d"),
+		OldRed, Teams[0]->Score, OldBlue, Teams[1]->Score);
 }
+
+
 
 void AUTeamArenaGame::Logout(AController* Exiting)
 {
