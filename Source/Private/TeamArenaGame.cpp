@@ -607,9 +607,8 @@ void AUTeamArenaGame::StartIntermission(int32 Seconds)
 	SetMatchState(FName(TEXT("RoundCooldown")));//MatchIntermission);
 }
 
-/**
- * REWRITTEN: This function is now ONLY responsible for spawning players and starting the round timer.
- * It is called by CallMatchStateChangeNotify when the state changes to InProgress.
+
+
 
 void AUTeamArenaGame::StartNextRound()
 {
@@ -628,10 +627,7 @@ void AUTeamArenaGame::StartNextRound()
 	}
 
 	// Reset per-round trackers
-	// Clear old camper data
 	CamperTracker.Empty();
-
-	// Start the check timer
 	StartCampCheckTimer();
 	RoundWinningKiller = nullptr;
 	RoundWinningKillTime = 0.0f;
@@ -645,12 +641,13 @@ void AUTeamArenaGame::StartNextRound()
 	Team1RoundDamage = 0.0f;
 	PlayerRoundDamage.Empty();
 	ResetPlayersForNewRound();
-	//ResetSpawnSelectionForNewRound();
 	DarkHorseCandidates.Empty();
 	ResetSpawnSelectionForNewRound();
+	Team0AlivePlayers.Empty();
+	Team1AlivePlayers.Empty();
+
+	// --- PER-TEAM SPAWN SELECTION ---
 	ScoreAllSpawnPoints();
-	// Select spawns ONCE per team — no correction pass.
-    // Alternate who picks first each round for fairness.
 	if (TotalRoundsPlayed % 2 == 0)
 	{
 		SelectOptimalSpawnPairForTeam(0);
@@ -662,10 +659,13 @@ void AUTeamArenaGame::StartNextRound()
 		SelectOptimalSpawnPairForTeam(0);
 	}
 
-
-	// 2. Spawn players for the *new* round
-	bAllowPlayerRespawns = true; // Allow RestartPlayer to work
-	int32 PlayersSpawned = 0;
+	// --- BUILD SPAWN QUEUE (staggered across frames) ---
+	// Spawning all players in one frame causes capsule overlap issues:
+	// two teammates at the same PlayerStart get depenetration-shoved
+	// into enemies, or the Z-fix can't detect the first pawn yet.
+	// One spawn per frame lets each capsule register before the next.
+	PendingSpawnQueue.Empty();
+	bAllowPlayerRespawns = true;
 
 	for (FConstControllerIterator It = GetWorld()->GetControllerIterator(); It; ++It)
 	{
@@ -675,183 +675,88 @@ void AUTeamArenaGame::StartNextRound()
 		AUTPlayerState* PS = Cast<AUTPlayerState>(C->PlayerState);
 		if (PS && !PS->bOnlySpectator)
 		{
-			// Make sure flags are reset
 			PS->bOutOfLives = false;
 			PS->ForceNetUpdate();
 
 			if (AUTPlayerController* PC = Cast<AUTPlayerController>(C))
 			{
-				// Force controller back into playing state
 				PC->ChangeState(NAME_Playing);
 				PC->ClientGotoState(NAME_Playing);
 			}
 
-			// Spawn the player
-			RestartPlayer(C);
-			PlayersSpawned++;
-
-
-			// Track team sizes for Last Man Standing
-			if (PS->Team)
-			{
-				if (PS->Team->TeamIndex == 0)
-				{
-					Team0StartingSize++;
-					Team0AlivePlayers.Add(PS); // Add to Team 0 alive players
-				}
-				else if (PS->Team->TeamIndex == 1)
-				{
-					Team1StartingSize++;
-					Team1AlivePlayers.Add(PS); // Add to Team 1 alive players
-				}
-			}
+			PendingSpawnQueue.Add(C);
 		}
 	}
 
-	bAllowPlayerRespawns = false; // Disable respawns again
-
-	UE_LOG(LogGameMode, Warning, TEXT("Round starting sizes - Team0: %d, Team1: %d"), Team0StartingSize, Team1StartingSize);
-
-	// 3. Set round timer
-	if (RoundTimeSeconds > 0)
+	// Process first spawn immediately, rest on subsequent frames
+	if (PendingSpawnQueue.Num() > 0)
 	{
-		RoundEndTimeSeconds = GetWorld()->GetTimeSeconds() + RoundTimeSeconds;
+		ProcessNextSpawn();
 	}
 	else
 	{
-		RoundEndTimeSeconds = 0.f;
+		// No players to spawn (empty server?) - finish immediately
+		OnAllPlayersSpawned();
 	}
-
-	// 4. Set final round state
-	bRoundInProgress = true;
-
-	if (AUTGameState* GS = GetWorld()->GetGameState<AUTGameState>())
-	{
-		
-		BP_OnSetRound(true, RoundTimeSeconds, LastRoundWinningTeamIndex, Team0AlivePlayers, Team1AlivePlayers);
-		BP_OnSetIntermission(false, 0);
-		// Still fine to force a net update on the base GameState
-		GS->ForceNetUpdate();
-	}
-
-	// 6. Broadcast "Round Start" message
-	// TODO: You may want a different message, but 0 is "Fight!"
-	BroadcastLocalized(this, UUTGameMessage::StaticClass(), 0, NULL, NULL, NULL);
-
-	// 7. Add a small delay before checking win conditions (in case of empty teams, etc)
-	WinCheckHoldUntilSeconds = GetWorld()->GetTimeSeconds() + 0.25f;
-	GetWorldTimerManager().ClearTimer(InitialWinCheckHandle);
-	GetWorldTimerManager().SetTimer(
-		InitialWinCheckHandle, this,
-		&AUTeamArenaGame::DelayedInitialWinCheck, 0.25f, false);
-
-	//UE_LOG(LogGameMode, Warning, TEXT("New round started. Manually attempted to spawn %d players."), PlayersSpawned);
 }
-*/
 
 
-void AUTeamArenaGame::StartNextRound()
+void AUTeamArenaGame::ProcessNextSpawn()
 {
-	UE_LOG(LogGameMode, Warning, TEXT("StartNextRound: Spawning players and starting round."));
-
-	if (bWarmupMode)
+	while (PendingSpawnQueue.Num() > 0)
 	{
-		bRoundInProgress = false;
-		return;
-	}
+		AController* C = PendingSpawnQueue[0];
+		PendingSpawnQueue.RemoveAt(0);
 
-	if (bAnnounceTeam)
-	{
-		bAnnounceTeam = false;
-		UE_LOG(LogGameMode, Warning, TEXT("Disabled team announcements for subsequent rounds"));
-	}
-
-	// Reset per-round trackers
-	CamperTracker.Empty();
-	StartCampCheckTimer();
-	RoundWinningKiller = nullptr;
-	RoundWinningKillTime = 0.0f;
-	bPendingDarkHorseReplay = false;
-	LastRoundWinningTeamIndex = INDEX_NONE;
-	bTeam0LastManAnnounced = false;
-	bTeam1LastManAnnounced = false;
-	Team0StartingSize = 0;
-	Team1StartingSize = 0;
-	Team0RoundDamage = 0.0f;
-	Team1RoundDamage = 0.0f;
-	PlayerRoundDamage.Empty();
-	ResetPlayersForNewRound();
-	DarkHorseCandidates.Empty();
-	ResetSpawnSelectionForNewRound();
-
-	// --- USE PRECOMPUTED LAYOUTS ---
-	// This replaces the old per-team SelectOptimalSpawnPairForTeam calls.
-	// Precomputed layouts guarantee symmetric safety for both teams.
-	// On small maps where no 2v2 layout is safe, it auto-falls back to 1v1 stacks.
-	SelectSpawnLayoutForRound();
-
-	// Fallback: if layout selection failed (no valid layouts), try the old path
-	if (Team0SelectedSpawns.Num() == 0 || Team1SelectedSpawns.Num() == 0)
-	{
-		UE_LOG(LogGameMode, Warning, TEXT("StartNextRound: Layout selection failed, falling back to per-team selection"));
-		ScoreAllSpawnPoints();
-		if (TotalRoundsPlayed % 2 == 0)
-		{
-			SelectOptimalSpawnPairForTeam(0);
-			SelectOptimalSpawnPairForTeam(1);
-		}
-		else
-		{
-			SelectOptimalSpawnPairForTeam(1);
-			SelectOptimalSpawnPairForTeam(0);
-		}
-	}
-
-	// 2. Spawn players for the new round
-	bAllowPlayerRespawns = true;
-	int32 PlayersSpawned = 0;
-
-	for (FConstControllerIterator It = GetWorld()->GetControllerIterator(); It; ++It)
-	{
-		AController* C = It->Get();
-		if (!C) continue;
+		if (!C || C->IsPendingKill()) continue;
 
 		AUTPlayerState* PS = Cast<AUTPlayerState>(C->PlayerState);
-		if (PS && !PS->bOnlySpectator)
+		if (!PS || PS->bOnlySpectator) continue;
+
+		// Spawn this player
+		RestartPlayer(C);
+
+		// Track team sizes
+		if (PS->Team)
 		{
-			PS->bOutOfLives = false;
-			PS->ForceNetUpdate();
-
-			if (AUTPlayerController* PC = Cast<AUTPlayerController>(C))
+			if (PS->Team->TeamIndex == 0)
 			{
-				PC->ChangeState(NAME_Playing);
-				PC->ClientGotoState(NAME_Playing);
+				Team0StartingSize++;
+				Team0AlivePlayers.Add(PS);
 			}
-
-			RestartPlayer(C);
-			PlayersSpawned++;
-
-			if (PS->Team)
+			else if (PS->Team->TeamIndex == 1)
 			{
-				if (PS->Team->TeamIndex == 0)
-				{
-					Team0StartingSize++;
-					Team0AlivePlayers.Add(PS);
-				}
-				else if (PS->Team->TeamIndex == 1)
-				{
-					Team1StartingSize++;
-					Team1AlivePlayers.Add(PS);
-				}
+				Team1StartingSize++;
+				Team1AlivePlayers.Add(PS);
 			}
 		}
+
+		// If more players remain, wait ~2 frames before spawning the next.
+		// One frame wasn't enough for the capsule collision to fully register.
+		// 0.05s is about 3 frames at 60fps, 2-3 frames at 120fps server tick.
+		if (PendingSpawnQueue.Num() > 0)
+		{
+			GetWorldTimerManager().SetTimer(
+				TimerHandle_StaggeredSpawn, this,
+				&AUTeamArenaGame::ProcessNextSpawn,
+				0.09f, false);
+			return;
+		}
+		break;
 	}
 
+	// Queue is empty - all players spawned
+	OnAllPlayersSpawned();
+}
+
+
+void AUTeamArenaGame::OnAllPlayersSpawned()
+{
 	bAllowPlayerRespawns = false;
 
 	UE_LOG(LogGameMode, Warning, TEXT("Round starting sizes - Team0: %d, Team1: %d"), Team0StartingSize, Team1StartingSize);
 
-	// 3. Set round timer
+	// Set round timer
 	if (RoundTimeSeconds > 0)
 	{
 		RoundEndTimeSeconds = GetWorld()->GetTimeSeconds() + RoundTimeSeconds;
@@ -861,7 +766,7 @@ void AUTeamArenaGame::StartNextRound()
 		RoundEndTimeSeconds = 0.f;
 	}
 
-	// 4. Set final round state
+	// Set final round state
 	bRoundInProgress = true;
 
 	if (AUTGameState* GS = GetWorld()->GetGameState<AUTGameState>())
@@ -1260,17 +1165,6 @@ bool AUTeamArenaGame::ValidateSpawnLocation(const FVector& TestLocation)
 
 APawn* AUTeamArenaGame::SpawnDefaultPawnFor_Implementation(AController* NewPlayer, AActor* StartSpot)
 {
-	// The default APawn::SpawnCollisionHandlingMethod is
-	// AdjustIfPossibleButDontSpawnIfColliding (see Pawn.cpp:65).
-	// When two teammates spawn at the same PlayerStart (stack spawn),
-	// the engine calls FindTeleportSpot which nudges the second player
-	// up to ~800 units in XY — potentially right into the enemy team.
-	//
-	// Fix: Use AlwaysSpawn so the pawn spawns exactly at the PlayerStart.
-	// The engine's character movement will naturally push overlapping
-	// capsules apart within 1-2 frames (DepenetrationVelocity), which
-	// only moves them ~40-60 units — safe and predictable.
-
 	FRotator StartRotation(ForceInit);
 	StartRotation.Yaw = StartSpot->GetActorRotation().Yaw;
 	FVector StartLocation = StartSpot->GetActorLocation();
@@ -1278,7 +1172,12 @@ APawn* AUTeamArenaGame::SpawnDefaultPawnFor_Implementation(AController* NewPlaye
 	FActorSpawnParameters SpawnInfo;
 	SpawnInfo.Instigator = Instigator;
 	SpawnInfo.ObjectFlags |= RF_Transient;
-	SpawnInfo.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+	// Use the engine default collision handling. With the 80ms staggered spawn
+	// delay, the previous pawn's capsule is fully registered by the time this
+	// one spawns. The engine will do a small safe adjustment (~50 units) if
+	// needed, instead of AlwaysSpawn which clips pawns together and causes
+	// violent depenetration teleports across the map.
+	SpawnInfo.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn;
 
 	UClass* PawnClass = GetDefaultPawnClassForController(NewPlayer);
 	APawn* ResultPawn = GetWorld()->SpawnActor<APawn>(PawnClass, FTransform(StartRotation, StartLocation), SpawnInfo);
@@ -1291,8 +1190,6 @@ APawn* AUTeamArenaGame::SpawnDefaultPawnFor_Implementation(AController* NewPlaye
 
 	return ResultPawn;
 }
-
-
 
 // Example: Your existing ScoreKill_Implementation (no changes needed)
 void AUTeamArenaGame::ScoreKill_Implementation(AController* Killer, AController* Other, APawn* KilledPawn, TSubclassOf<UDamageType> DamageType)
@@ -1510,39 +1407,52 @@ AActor* AUTeamArenaGame::FindPlayerStart_Implementation(AController* Player, con
 }
 
 
+
 void AUTeamArenaGame::PrecomputeSpawnLayouts()
 {
 	ValidLayouts_2v2.Empty();
 	ValidLayouts_1v1.Empty();
 
-	// Gather all spawn points
+	// Use AllSpawnPoints (already filtered by InitializeSpawnPointSystem)
+	// instead of re-scanning the world with TActorIterator, which would
+	// re-include spawns we intentionally removed (e.g., highest spawn).
 	TArray<APlayerStart*> AllSpawns;
-	for (TActorIterator<APlayerStart> It(GetWorld()); It; ++It)
+	for (const FSpawnPointData& SPD : AllSpawnPoints)
 	{
-		if (APlayerStart* Spawn = *It)
+		if (SPD.PlayerStart && !SPD.PlayerStart->IsPendingKill())
 		{
-			AllSpawns.Add(Spawn);
+			// Filter out spawns that are flagged for other game modes
+			AUTPlayerStart* UTPS = Cast<AUTPlayerStart>(SPD.PlayerStart);
+			if (UTPS && UTPS->bIgnoreInShowdown)
+				continue;
+
+			// Filter out team-tagged spawns (UTTeamPlayerStart with a TeamNum).
+			// These are placed for CTF/Blitz flag bases and will be inside geometry
+			// or right next to enemy objectives.
+			AUTTeamPlayerStart* TeamStart = Cast<AUTTeamPlayerStart>(SPD.PlayerStart);
+			if (TeamStart)
+				continue;
+
+			AllSpawns.Add(SPD.PlayerStart);
 		}
 	}
 
 	const int32 N = AllSpawns.Num();
 	if (N < 2)
 	{
-		UE_LOG(LogGameMode, Error, TEXT("PrecomputeSpawnLayouts: Only %d spawns on map!"), N);
+		UE_LOG(LogGameMode, Error, TEXT("PrecomputeSpawnLayouts: Only %d usable spawns on map!"), N);
 		return;
 	}
 
-	//const float SafetyThreshold = MinimumEnemyHorizontalDistance; // Your BP value (6000)
 	const float SafetyThreshold = FMath::Min(MinimumEnemyHorizontalDistance, 2900.0f);
+
 	// -------------------------------------------------------
 	// PHASE 1: Build all valid 2v2 layouts
 	// -------------------------------------------------------
-	// T0 pair = (a, b), T1 pair = (c, d), all four unique spawns
 	for (int32 a = 0; a < N; ++a)
 	{
 		for (int32 b = a + 1; b < N; ++b)
 		{
-			// Check teammate separation for T0
 			float T0Sep = (AllSpawns[a]->GetActorLocation() - AllSpawns[b]->GetActorLocation()).Size2D();
 			if (T0Sep < MinTeammateSeparation2D || T0Sep > MaxTeammateSeparation2D)
 				continue;
@@ -1555,16 +1465,11 @@ void AUTeamArenaGame::PrecomputeSpawnLayouts()
 				{
 					if (d == a || d == b) continue;
 
-					// Check teammate separation for T1
 					float T1Sep = (AllSpawns[c]->GetActorLocation() - AllSpawns[d]->GetActorLocation()).Size2D();
 					if (T1Sep < MinTeammateSeparation2D || T1Sep > MaxTeammateSeparation2D)
 						continue;
 
-					// --- SAFETY CHECK: All cross-team distances must be safe ---
-					// This is the KEY invariant. Every T0 spawn must be far from every T1 spawn.
 					float MinCross = FLT_MAX;
-
-					// 4 cross-team checks (2 x 2)
 					float D_ac = (AllSpawns[a]->GetActorLocation() - AllSpawns[c]->GetActorLocation()).Size2D();
 					float D_ad = (AllSpawns[a]->GetActorLocation() - AllSpawns[d]->GetActorLocation()).Size2D();
 					float D_bc = (AllSpawns[b]->GetActorLocation() - AllSpawns[c]->GetActorLocation()).Size2D();
@@ -1575,11 +1480,9 @@ void AUTeamArenaGame::PrecomputeSpawnLayouts()
 					MinCross = FMath::Min(MinCross, D_bc);
 					MinCross = FMath::Min(MinCross, D_bd);
 
-					// HARD REJECT: if any cross-team pair is too close, this layout is invalid
 					if (MinCross < SafetyThreshold)
 						continue;
 
-					// --- GRADE THIS LAYOUT ---
 					FSpawnLayout Layout;
 					Layout.T0_Primary = AllSpawns[a];
 					Layout.T0_Secondary = AllSpawns[b];
@@ -1589,9 +1492,6 @@ void AUTeamArenaGame::PrecomputeSpawnLayouts()
 					Layout.T0Separation = T0Sep;
 					Layout.T1Separation = T1Sep;
 					Layout.UsageCount = 0;
-
-					// Quality score: reward maximum cross-team distance
-					// with a smaller bonus for good teammate spread
 					Layout.QualityScore = MinCross
 						+ FMath::Min(T0Sep, 1500.0f) * 0.3f
 						+ FMath::Min(T1Sep, 1500.0f) * 0.3f;
@@ -1605,7 +1505,11 @@ void AUTeamArenaGame::PrecomputeSpawnLayouts()
 	// -------------------------------------------------------
 	// PHASE 2: Build all valid 1v1 (stack) layouts
 	// -------------------------------------------------------
-	// Each team gets ONE spawn point. Both players on each team spawn there.
+	// Use a lower threshold for stacks — the original 5000 is too aggressive
+	// for small/medium maps and results in zero valid 1v1 layouts.
+	// 2900 (the same as 2v2 cross-distance) is safe because stack spawns
+	// don't have the teammate-collision-teleport problem anymore
+	// (SpawnDefaultPawnFor now uses AlwaysSpawn).
 	const float StackSafetyThreshold = FMath::Max(SafetyThreshold, MinimumStackSpawnDistance2D);
 
 	for (int32 a = 0; a < N; ++a)
@@ -1621,9 +1525,9 @@ void AUTeamArenaGame::PrecomputeSpawnLayouts()
 
 			FSpawnLayout Layout;
 			Layout.T0_Primary = AllSpawns[a];
-			Layout.T0_Secondary = nullptr; // Stack: both players spawn here
+			Layout.T0_Secondary = nullptr;
 			Layout.T1_Primary = AllSpawns[b];
-			Layout.T1_Secondary = nullptr; // Stack: both players spawn here
+			Layout.T1_Secondary = nullptr;
 			Layout.MinCrossDistance2D = Dist2D;
 			Layout.T0Separation = 0.f;
 			Layout.T1Separation = 0.f;
@@ -1646,6 +1550,7 @@ void AUTeamArenaGame::PrecomputeSpawnLayouts()
 		});
 
 	UE_LOG(LogGameMode, Log, TEXT("=== SPAWN PRECOMPUTE COMPLETE ==="));
+	UE_LOG(LogGameMode, Log, TEXT("  Usable spawns: %d"), N);
 	UE_LOG(LogGameMode, Log, TEXT("  Valid 2v2 layouts: %d"), ValidLayouts_2v2.Num());
 	UE_LOG(LogGameMode, Log, TEXT("  Valid 1v1 layouts: %d"), ValidLayouts_1v1.Num());
 
@@ -1658,12 +1563,15 @@ void AUTeamArenaGame::PrecomputeSpawnLayouts()
 	if (ValidLayouts_2v2.Num() == 0 && ValidLayouts_1v1.Num() == 0)
 	{
 		UE_LOG(LogGameMode, Error, TEXT("  !!! NO VALID SPAWN LAYOUTS - MAP IS BROKEN OR THRESHOLD TOO HIGH !!!"));
+		UE_LOG(LogGameMode, Error, TEXT("  SafetyThreshold=%.0f  StackSafetyThreshold=%.0f"), SafetyThreshold, StackSafetyThreshold);
 	}
 	else if (ValidLayouts_2v2.Num() == 0)
 	{
 		UE_LOG(LogGameMode, Warning, TEXT("  No valid 2v2 layouts - all rounds will use 1v1 stack spawns on this map"));
 	}
 }
+
+
 
 void AUTeamArenaGame::SelectSpawnLayoutForRound()
 {
@@ -1763,12 +1671,21 @@ void AUTeamArenaGame::InitializeSpawnPointSystem()
 	{
 		if (APlayerStart* Spawn = *It)
 		{
+			// Skip spawns meant for other game modes
+			AUTPlayerStart* UTPS = Cast<AUTPlayerStart>(Spawn);
+			if (UTPS && UTPS->bIgnoreInShowdown)
+				continue;
+
+			// Skip team-tagged spawns (CTF/Blitz flag-base spawns)
+			if (Cast<AUTTeamPlayerStart>(Spawn))
+				continue;
+
 			AllSpawnPoints.Add(FSpawnPointData(Spawn));
 		}
 	}
 	if (AllSpawnPoints.Num() < 2)
 	{
-		UE_LOG(LogGameMode, Error, TEXT("InitializeSpawnPointSystem: Insufficient spawn points (%d), need at least 4"), AllSpawnPoints.Num());
+		UE_LOG(LogGameMode, Error, TEXT("InitializeSpawnPointSystem: Insufficient spawn points (%d), need at least 2"), AllSpawnPoints.Num());
 		return;
 	}
 
@@ -1778,11 +1695,10 @@ void AUTeamArenaGame::InitializeSpawnPointSystem()
 	// Only run this if we have enough spawns to safely remove some
 	if (AllSpawnPoints.Num() > 4)
 	{
-		// Sort by height, descending (tallest first)
 		AllSpawnPoints.Sort([](const FSpawnPointData& A, const FSpawnPointData& B)
-		{
-			return A.HeightScore > B.HeightScore;
-		});
+			{
+				return A.HeightScore > B.HeightScore;
+			});
 
 		UE_LOG(LogGameMode, Warning, TEXT("InitializeSpawnPointSystem: Removing top spawn for fairness."));
 
@@ -1791,10 +1707,7 @@ void AUTeamArenaGame::InitializeSpawnPointSystem()
 			UE_LOG(LogGameMode, Warning, TEXT("  - Removing: %s (HeightScore: %f)"), *AllSpawnPoints[0].PlayerStart->GetName(), AllSpawnPoints[0].HeightScore);
 		}
 
-		
-		// Remove the top  spawn from the list
 		AllSpawnPoints.RemoveAt(0);
-
 	}
 	UE_LOG(LogGameMode, Log, TEXT("InitializeSpawnPointSystem: Analyzed %d spawn points"), AllSpawnPoints.Num());
 }
@@ -3367,6 +3280,10 @@ void AUTeamArenaGame::BP_RestartCurrentRound()
 	// Clear any pending timers that might interfere
 	GetWorldTimerManager().ClearTimer(TH_RoundEndDelay);
 	GetWorldTimerManager().ClearTimer(InitialWinCheckHandle);
+	GetWorldTimerManager().ClearTimer(TimerHandle_StaggeredSpawn);
+
+	// Cancel any in-progress staggered spawns
+	PendingSpawnQueue.Empty();
 
 	// Force end current round state immediately
 	bRoundInProgress = false;
@@ -3386,13 +3303,11 @@ void AUTeamArenaGame::BP_RestartCurrentRound()
 	ResetPlayersForNewRound();
 	CleanupWorldForNewRound();
 
-	// Use the precomputed layout system — same as StartNextRound.
-	// ResetSpawnSelectionForNewRound increments CurrentRoundNumber,
-	// which SelectSpawnLayoutForRound uses for team-side alternation.
+	// Reset spawn selection (increments CurrentRoundNumber for axis rotation)
 	ResetSpawnSelectionForNewRound();
-	SelectSpawnLayoutForRound();
 
 	// Start a brief intermission before the new round
+	// When intermission ends, DefaultTimer sets InProgress -> CallMatchStateChangeNotify -> StartNextRound
 	StartIntermission(4);
 }
 

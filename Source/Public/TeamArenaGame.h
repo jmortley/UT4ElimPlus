@@ -188,7 +188,7 @@ public:
 	bool ValidateSpawnLocation(const FVector& TestLocation);
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spawning")
-	float MinimumStackSpawnDistance2D = 5000.0f;
+	float MinimumStackSpawnDistance2D = 4000.0f;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spawning")
 	int32 ForceStackEveryNRounds = 3;
@@ -430,6 +430,7 @@ public:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Arena|AntiCamp")
 	float CampWarnCooldown = 5.0f;
 
+
 	// -------- Anti-Camp Events --------
 
 	/** * Triggered when camping is detected.
@@ -443,6 +444,19 @@ public:
 	UFUNCTION(BlueprintImplementableEvent, Category = "Arena|AntiCamp")
 	void BP_OnCamperClear(AUTPlayerState* CamperPS);
 
+// -------- Staggered Spawn System --------
+/** Queue of controllers waiting to be spawned (processed one per frame) */
+	UPROPERTY(Transient)
+	TArray<AController*> PendingSpawnQueue;
+
+	/** Timer handle for staggered spawn processing */
+	FTimerHandle TimerHandle_StaggeredSpawn;
+
+	/** Process the next player in the spawn queue */
+	void ProcessNextSpawn();
+
+	/** Called after all queued spawns are complete */
+	void OnAllPlayersSpawned();
 
 protected:
 	/** Map to store history for each player without modifying PlayerState class */
