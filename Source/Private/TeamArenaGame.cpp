@@ -739,7 +739,7 @@ void AUTeamArenaGame::ProcessNextSpawn()
 			GetWorldTimerManager().SetTimer(
 				TimerHandle_StaggeredSpawn, this,
 				&AUTeamArenaGame::ProcessNextSpawn,
-				0.09f, false);
+				0.05f, false);
 			return;
 		}
 		break;
@@ -1169,29 +1169,101 @@ APawn* AUTeamArenaGame::SpawnDefaultPawnFor_Implementation(AController* NewPlaye
 	StartRotation.Yaw = StartSpot->GetActorRotation().Yaw;
 	FVector StartLocation = StartSpot->GetActorLocation();
 
+	UClass* PawnClass = GetDefaultPawnClassForController(NewPlayer);
+	if (!PawnClass)
+	{
+		UE_LOG(LogGameMode, Warning, TEXT("SpawnDefaultPawnFor: No PawnClass for %s"),
+			*GetNameSafe(NewPlayer));
+		return nullptr;
+	}
+
+	// --- ATTEMPT 1: Strict spawn at exact PlayerStart ---
 	FActorSpawnParameters SpawnInfo;
 	SpawnInfo.Instigator = Instigator;
 	SpawnInfo.ObjectFlags |= RF_Transient;
-	// Use the engine default collision handling. With the 80ms staggered spawn
-	// delay, the previous pawn's capsule is fully registered by the time this
-	// one spawns. The engine will do a small safe adjustment (~50 units) if
-	// needed, instead of AlwaysSpawn which clips pawns together and causes
-	// violent depenetration teleports across the map.
-	SpawnInfo.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn;
+	SpawnInfo.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButDontSpawnIfColliding;
 
-	UClass* PawnClass = GetDefaultPawnClassForController(NewPlayer);
 	APawn* ResultPawn = GetWorld()->SpawnActor<APawn>(PawnClass, FTransform(StartRotation, StartLocation), SpawnInfo);
+
+	// --- ATTEMPT 2: Cardinal offsets (shoulder-width, ~45 units) ---
+	// UT4 capsule radius is ~34-40 units. 45 units places them just
+	// outside the existing pawn's capsule without overshooting into walls.
+	if (!ResultPawn)
+	{
+		const FVector Offsets[] = {
+			FVector(45.f,   0.f, 0.f),
+			FVector(-45.f,   0.f, 0.f),
+			FVector(0.f,  45.f, 0.f),
+			FVector(0.f, -45.f, 0.f),
+		};
+
+		for (const FVector& Offset : Offsets)
+		{
+			ResultPawn = GetWorld()->SpawnActor<APawn>(PawnClass, FTransform(StartRotation, StartLocation + Offset), SpawnInfo);
+			if (ResultPawn)
+			{
+				UE_LOG(LogGameMode, Log, TEXT("SpawnDefaultPawnFor: Used offset spawn at %s"), *StartSpot->GetName());
+				break;
+			}
+		}
+	}
+
+	// --- ATTEMPT 3: Force spawn with micro-jitter ---
+	// AlwaysSpawn skips FindTeleportSpot entirely, so it won't sweep
+	// through walls. The jitter prevents two force-spawned pawns from
+	// sharing the exact same origin (which causes physics explosions).
+	if (!ResultPawn)
+	{
+		SpawnInfo.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+		FVector JitteredLocation = StartLocation + FVector(FMath::RandRange(-10.f, 10.f), FMath::RandRange(-10.f, 10.f), 0.f);
+		ResultPawn = GetWorld()->SpawnActor<APawn>(PawnClass, FTransform(StartRotation, JitteredLocation), SpawnInfo);
+		UE_LOG(LogGameMode, Warning, TEXT("SpawnDefaultPawnFor: Force-spawned at %s"), *StartSpot->GetName());
+	}
 
 	if (!ResultPawn)
 	{
-		UE_LOG(LogGameMode, Warning, TEXT("SpawnDefaultPawnFor: Couldn't spawn Pawn of type %s at %s"),
-			*GetNameSafe(PawnClass), *StartLocation.ToString());
+		UE_LOG(LogGameMode, Error, TEXT("SpawnDefaultPawnFor: COMPLETE FAILURE at %s"), *StartLocation.ToString());
+		return nullptr;
+	}
+
+	// --- POST-SPAWN VALIDATION ---
+	FVector PawnLocation = ResultPawn->GetActorLocation();
+	bool bLocationBad = false;
+
+	// Drift check: engine shoved pawn too far
+	float Drift2D = (PawnLocation - StartLocation).Size2D();
+	if (Drift2D > 300.0f || FMath::Abs(PawnLocation.Z - StartLocation.Z) > 200.0f)
+	{
+		bLocationBad = true;
+	}
+
+	// Floor check: no walkable ground beneath
+	if (!bLocationBad)
+	{
+		FHitResult FloorHit;
+		FCollisionQueryParams FloorParams(TEXT("SpawnFloorCheck"), false, ResultPawn);
+		bool bHitFloor = GetWorld()->LineTraceSingleByChannel(
+			FloorHit, PawnLocation, PawnLocation - FVector(0.f, 0.f, 300.0f),
+			ECC_WorldStatic, FloorParams);
+
+		if (!bHitFloor || FloorHit.ImpactNormal.Z < 0.7f)
+		{
+			bLocationBad = true;
+		}
+	}
+
+	// Recovery: teleport back with jitter to prevent overlap explosions
+	if (bLocationBad)
+	{
+		FVector SafeRecoveryLoc = StartLocation + FVector(FMath::RandRange(-10.f, 10.f), FMath::RandRange(-10.f, 10.f), 20.0f);
+		ResultPawn->SetActorLocation(SafeRecoveryLoc, false, nullptr, ETeleportType::TeleportPhysics);
+		UE_LOG(LogGameMode, Warning, TEXT("SpawnDefaultPawnFor: Bad location detected, reset to PlayerStart"));
 	}
 
 	return ResultPawn;
 }
 
-// Example: Your existing ScoreKill_Implementation (no changes needed)
+
 void AUTeamArenaGame::ScoreKill_Implementation(AController* Killer, AController* Other, APawn* KilledPawn, TSubclassOf<UDamageType> DamageType)
 {
 	// Call parent for individual player scoring only (no team score changes)
